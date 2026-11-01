@@ -150,7 +150,23 @@ function checkFile(file) {
         problems.push(`${kind} without a name`);
         continue;
       }
-      const key = `${kind}:${name.toLowerCase()}`;
+
+      // Functions may be legitimately OVERLOADED: the same name with a
+      // different argument list is a distinct function in PostgreSQL. Key on
+      // the normalised argument types so an overload is not a false positive.
+      let key = `${kind}:${name.toLowerCase()}`;
+      if (kind === 'function') {
+        const argsStart = match.index + match[0].length;
+        const argsEnd = cleaned.indexOf(')', argsStart);
+        const args = argsEnd === -1 ? '' : cleaned.slice(argsStart, argsEnd);
+        const argTypes = args
+          .split(',')
+          .map((arg) => arg.trim().split(/\s+/).slice(1).join(' ').toLowerCase())
+          .filter(Boolean)
+          .join(',');
+        key = `${key}(${argTypes})`;
+      }
+
       if (seen.has(key)) {
         problems.push(`duplicate ${kind} "${name}" (first at offset ${seen.get(key)})`);
       } else {

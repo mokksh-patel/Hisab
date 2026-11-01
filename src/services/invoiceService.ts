@@ -25,6 +25,10 @@ export interface CreateInvoiceInput {
   lines: CreateInvoiceLinePayload[];
   notes?: string | null;
   invoiceNumber?: string | null;
+  /** When true, line unit prices are treated as tax-inclusive. */
+  priceIncludesTax?: boolean;
+  /** Invoice-level discount in paise, allocated across lines by the database. */
+  invoiceDiscountPaise?: bigint;
 }
 
 export interface InvoiceListFilters {
@@ -54,6 +58,8 @@ export async function createInvoice(input: CreateInvoiceInput): Promise<string> 
       p_lines: input.lines,
       p_notes: input.notes ?? null,
       p_invoice_number: input.invoiceNumber ?? null,
+      p_price_includes_tax: input.priceIncludesTax ?? false,
+      p_invoice_discount_paise: (input.invoiceDiscountPaise ?? 0n).toString(),
     }),
   );
   return data as string;

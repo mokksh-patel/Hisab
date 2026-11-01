@@ -118,3 +118,93 @@
     }
   }
 }
+
+/* ==========================================================================
+   Print stylesheet — clean invoice output.
+
+   When the user clicks Print on an invoice, only the invoice document should
+   appear on paper: no sidebar, no topbar, no buttons, no page background.
+   ========================================================================== */
+
+@media print {
+  /* Hide application chrome. */
+  aside,
+  header,
+  nav,
+  [data-print-hide] {
+    display: none !important;
+  }
+
+  /* Remove the sidebar offset so content uses the full page. */
+  .lg\:pl-\[250px\] {
+    padding-left: 0 !important;
+  }
+
+  html,
+  body {
+    background: #ffffff !important;
+    color: #000000 !important;
+    font-size: 11pt;
+  }
+
+  main {
+    max-width: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  /* Cards become plain bordered blocks without shadows or rounding. */
+  .card {
+    border: 1px solid #d0d0d0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    break-inside: avoid;
+  }
+
+  /* Tables must not split awkwardly across pages. */
+  table {
+    width: 100% !important;
+    min-width: 0 !important;
+    border-collapse: collapse;
+  }
+
+  thead {
+    display: table-header-group;
+  }
+
+  tr {
+    break-inside: avoid;
+  }
+
+  th,
+  td {
+    padding: 4pt 6pt !important;
+    font-size: 10pt;
+  }
+
+  /* Links print as plain text, not blue underlines. */
+  a {
+    color: #000000 !important;
+    text-decoration: none !important;
+  }
+
+  /* Keep the invoice number and totals legible. */
+  h1 {
+    font-size: 16pt !important;
+  }
+
+  h2 {
+    font-size: 12pt !important;
+  }
+
+  /* Force background colours to print where they carry meaning. */
+  * {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /* Page margins. */
+  @page {
+    margin: 12mm;
+  }
+}

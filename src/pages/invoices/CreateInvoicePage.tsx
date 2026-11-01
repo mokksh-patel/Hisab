@@ -10,6 +10,7 @@ import { addDays, todayInTimeZone } from '@/lib/dateUtils';
 import { parseRupeesToPaise, tryParseRupeesToPaise, type Paise } from '@/lib/money';
 import {
   calculateInvoiceTotals,
+  placeOfSupplyWarning,
   type GstMode,
   type InvoiceLineInput,
 } from '@/lib/invoiceCalculations';
@@ -66,6 +67,8 @@ export default function CreateInvoicePage() {
     addDays(today, currentBusiness?.default_credit_period_days ?? 30),
   );
   const [gstMode, setGstMode] = useState<GstMode>('intra_state');
+  const [priceIncludesTax, setPriceIncludesTax] = useState(false);
+  const [invoiceDiscount, setInvoiceDiscount] = useState('');
   const [notes, setNotes] = useState('');
   const [lines, setLines] = useState<LineDraft[]>([newLine()]);
   const [formError, setFormError] = useState<string | null>(null);
@@ -107,11 +110,25 @@ export default function CreateInvoicePage() {
     }
     if (parsed.length === 0) return null;
     try {
-      return calculateInvoiceTotals(parsed, gstMode);
+      return calculateInvoiceTotals(parsed, gstMode, {
+        priceIncludesTax,
+        invoiceDiscountPaise: tryParseRupeesToPaise(invoiceDiscount || '0') ?? 0n,
+      });
     } catch {
       return null;
     }
-  }, [lines, gstMode]);
+  }, [lines, gstMode, priceIncludesTax, invoiceDiscount]);
+
+  /** Warn when the GST treatment cannot be determined from the available data. */
+  const gstWarning = useMemo(
+    () =>
+      placeOfSupplyWarning(
+        currentBusiness?.state_code ?? null,
+        customersQuery.data?.find((c) => c.id === customerId)?.state_code ?? null,
+        gstMode,
+      ),
+    [currentBusiness?.state_code, customersQuery.data, customerId, gstMode],
+  );
 
   function updateLine(key: string, patch: Partial<LineDraft>) {
     setLines((current) => current.map((line) => (line.key === key ? { ...line, ...patch } : line)));
@@ -171,6 +188,8 @@ export default function CreateInvoicePage() {
         placeOfSupplyStateCode: currentBusiness?.state_code ?? null,
         lines: payloadLines,
         notes: notes.trim() || null,
+        priceIncludesTax,
+        invoiceDiscountPaise: tryParseRupeesToPaise(invoiceDiscount || '0') ?? 0n,
       });
 
       if (mode === 'issue') {
@@ -253,6 +272,40 @@ export default function CreateInvoicePage() {
                 onChange={(event) => setGstMode(event.target.value as GstMode)}
                 hint={`Suggested from your state (${currentBusiness?.state_code ?? 'not set'}).`}
               />
+
+              {gstWarning && (
+                <div
+                  role="status"
+                  className="rounded-lg border border-warning-100 bg-warning-50 px-3 py-2 text-xs text-warning-700"
+                >
+                  {gstWarning}
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <Select
+                  label="Price entry"
+                  options={[
+                    { value: 'exclusive', label: 'Prices exclude GST' },
+                    { value: 'inclusive', label: 'Prices include GST' },
+                  ]}
+                  value={priceIncludesTax ? 'inclusive' : 'exclusive'}
+                  onChange={(event) => setPriceIncludesTax(event.target.value === 'inclusive')}
+                  hint={
+                    priceIncludesTax
+                      ? 'The customer pays the entered amount; tax is back-calculated.'
+                      : 'GST is added on top of the entered amount.'
+                  }
+                />
+                <Input
+                  label="Invoice discount (₹)"
+                  inputMode="decimal"
+                  placeholder="0.00"
+                  value={invoiceDiscount}
+                  onChange={(event) => setInvoiceDiscount(event.target.value)}
+                  hint="Applied across all lines in proportion to taxable value."
+                />
+              </div>
             </CardBody>
           </Card>
 

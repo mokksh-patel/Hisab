@@ -210,10 +210,12 @@ export default function InvoiceDetailPage() {
                 Send reminder
               </Button>
             )}
-            <Button size="sm" variant="ghost" onClick={() => window.print()}>
-              <Printer className="size-4" aria-hidden="true" />
-              Print
-            </Button>
+            <span data-print-hide>
+              <Button size="sm" variant="ghost" onClick={() => window.print()}>
+                <Printer className="size-4" aria-hidden="true" />
+                Print
+              </Button>
+            </span>
           </>
         }
       />
@@ -238,6 +240,56 @@ export default function InvoiceDetailPage() {
                   value={derived.outstanding}
                   className="mt-1 block text-lg font-semibold"
                 />
+              </div>
+            </CardBody>
+          </Card>
+
+          {/* Tax breakdown */}
+          <Card>
+            <CardHeader
+              title="Tax breakdown"
+              description={
+                invoice.price_includes_tax
+                  ? 'Prices were entered GST-inclusive'
+                  : 'Prices were entered GST-exclusive'
+              }
+            />
+            <CardBody className="space-y-2 text-sm">
+              <Detail
+                label="Subtotal (before discount)"
+                value={<CurrencyDisplay value={parsePaise(invoice.subtotal_paise)} />}
+              />
+              {parsePaise(invoice.discount_paise) > 0n && (
+                <Detail
+                  label="Item discounts"
+                  value={<CurrencyDisplay value={parsePaise(invoice.discount_paise)} />}
+                />
+              )}
+              {parsePaise(invoice.invoice_discount_paise) > 0n && (
+                <Detail
+                  label="Invoice discount"
+                  value={<CurrencyDisplay value={parsePaise(invoice.invoice_discount_paise)} />}
+                />
+              )}
+              <Detail
+                label="Taxable value"
+                value={<CurrencyDisplay value={parsePaise(invoice.taxable_amount_paise)} />}
+              />
+              {parsePaise(invoice.cgst_paise) > 0n && (
+                <Detail label="CGST" value={<CurrencyDisplay value={parsePaise(invoice.cgst_paise)} />} />
+              )}
+              {parsePaise(invoice.sgst_paise) > 0n && (
+                <Detail label="SGST" value={<CurrencyDisplay value={parsePaise(invoice.sgst_paise)} />} />
+              )}
+              {parsePaise(invoice.igst_paise) > 0n && (
+                <Detail label="IGST" value={<CurrencyDisplay value={parsePaise(invoice.igst_paise)} />} />
+              )}
+              {parsePaise(invoice.cess_paise) > 0n && (
+                <Detail label="Cess" value={<CurrencyDisplay value={parsePaise(invoice.cess_paise)} />} />
+              )}
+              <div className="flex items-center justify-between border-t border-line pt-2 text-base font-semibold">
+                <span>Total</span>
+                <CurrencyDisplay value={parsePaise(invoice.total_amount_paise)} />
               </div>
             </CardBody>
           </Card>
@@ -403,7 +455,7 @@ export default function InvoiceDetailPage() {
   );
 }
 
-function Detail({ label, value }: { label: string; value: string }) {
+function Detail({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div className="flex items-start justify-between gap-3">
       <span className="text-muted">{label}</span>

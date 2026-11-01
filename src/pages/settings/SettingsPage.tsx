@@ -6,8 +6,9 @@ import { toAppError } from '@/lib/errors';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Button } from '@/components/ui/Button';
 import { Card, CardBody, CardHeader } from '@/components/ui/Card';
-import { Input } from '@/components/ui/Input';
+import { Input, Select } from '@/components/ui/Input';
 import { useToast } from '@/components/ui/Toast';
+import type { GstScheme } from '@/types/database';
 
 export default function SettingsPage() {
   const queryClient = useQueryClient();
@@ -18,6 +19,7 @@ export default function SettingsPage() {
   const [legalName, setLegalName] = useState(currentBusiness?.legal_name ?? '');
   const [invoicePrefix, setInvoicePrefix] = useState(currentBusiness?.invoice_prefix ?? 'INV');
   const [creditDays, setCreditDays] = useState(String(currentBusiness?.default_credit_period_days ?? 30));
+  const [gstScheme, setGstScheme] = useState(currentBusiness?.gst_scheme ?? 'unregistered');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -36,6 +38,9 @@ export default function SettingsPage() {
         legal_name: legalName.trim(),
         invoice_prefix: invoicePrefix.trim().toUpperCase(),
         default_credit_period_days: Number(creditDays),
+        gst_scheme: gstScheme,
+        // Confirming the scheme clears the migration review flag.
+        gst_scheme_needs_review: false,
       });
       toast.success('Settings saved.');
       await queryClient.invalidateQueries({ queryKey: ['my-businesses'] });
@@ -89,6 +94,35 @@ export default function SettingsPage() {
               disabled={!canManageBusiness}
             />
           </div>
+
+          {currentBusiness.gst_scheme_needs_review && (
+            <div
+              role="status"
+              className="rounded-lg border border-warning-100 bg-warning-50 px-3 py-2 text-xs text-warning-700"
+            >
+              Your GST scheme was set to <strong>Regular</strong> automatically during an upgrade.
+              Please confirm it below — a composition-scheme business must not issue tax invoices.
+            </div>
+          )}
+
+          <Select
+            label="GST scheme"
+            options={[
+              { value: 'unregistered', label: 'Not registered for GST' },
+              { value: 'regular', label: 'Regular GST registration' },
+              { value: 'composition', label: 'Composition scheme' },
+            ]}
+            value={gstScheme}
+            onChange={(event) => setGstScheme(event.target.value as GstScheme)}
+            disabled={!canManageBusiness}
+            hint={
+              gstScheme === 'composition'
+                ? 'Composition businesses cannot issue tax invoices — use exempt supply.'
+                : gstScheme === 'unregistered'
+                  ? 'Unregistered businesses cannot charge GST on invoices.'
+                  : 'Regular businesses may issue tax invoices with CGST/SGST or IGST.'
+            }
+          />
 
           <div className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-muted">
             <p>GSTIN: {currentBusiness.gstin ?? 'Not set'}</p>

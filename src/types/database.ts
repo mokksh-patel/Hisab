@@ -12,6 +12,10 @@ export type DocumentState = 'draft' | 'issued' | 'void';
 export type PaymentMethod = 'cash' | 'bank_transfer' | 'upi' | 'cheque' | 'card' | 'other';
 export type ChequeStatus = 'not_applicable' | 'pending' | 'cleared' | 'bounced';
 export type GstMode = 'intra_state' | 'inter_state' | 'exempt';
+/** GST registration category. Composition businesses may not issue tax invoices. */
+export type GstScheme = 'unregistered' | 'regular' | 'composition';
+/** How an invoice line's discount was entered. */
+export type DiscountType = 'none' | 'percent' | 'fixed';
 
 export interface Business {
   id: string;
@@ -33,6 +37,10 @@ export interface Business {
   default_credit_period_days: number;
   default_tax_rate_basis_points: number;
   is_gst_registered: boolean;
+  /** GST registration category. Nullable for rows created before migration 0005. */
+  gst_scheme: GstScheme | null;
+  /** True when the scheme was inferred during migration and needs owner review. */
+  gst_scheme_needs_review: boolean;
   reminder_template: string | null;
   created_at: string;
   updated_at: string;
@@ -97,6 +105,10 @@ export interface Invoice {
   cess_paise: string;
   total_tax_paise: string;
   total_amount_paise: string;
+  /** True when line unit prices were entered tax-inclusive. */
+  price_includes_tax: boolean;
+  /** Invoice-level discount. `discount_paise` remains the sum of item discounts. */
+  invoice_discount_paise: string;
   customer_snapshot: Record<string, unknown> | null;
   notes: string | null;
   issued_at: string | null;
@@ -118,6 +130,10 @@ export interface InvoiceItem {
   unit: string | null;
   unit_price_paise: string;
   discount_percent_basis_points: number;
+  /** How the discount was entered. */
+  discount_type: DiscountType;
+  /** Raw discount input: basis points for percent, paise for fixed. */
+  discount_value: string;
   gross_amount_paise: string;
   discount_paise: string;
   taxable_amount_paise: string;
@@ -245,7 +261,12 @@ export interface CreateInvoiceLinePayload {
   quantity: string;
   unit: string | null;
   unit_price_paise: string;
+  /** Legacy percentage discount. Ignored when `discount_type` is supplied. */
   discount_percent_basis_points: number;
+  /** How the discount was entered. Omit to use the legacy percentage field. */
+  discount_type?: DiscountType;
+  /** Basis points for 'percent', paise for 'fixed'. */
+  discount_value?: string;
   tax_rate_basis_points: number;
   cess_rate_basis_points: number;
 }
