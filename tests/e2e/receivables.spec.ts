@@ -197,4 +197,3 @@ async function signInInBrowser(
 
   await expect(page).toHaveURL('/', { timeout: 25_000 });
 }
-
