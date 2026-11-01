@@ -1,0 +1,58 @@
+{
+  "name": "bizpilot",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "BizPilot — multi-tenant business management & accounts receivable SaaS for Indian small businesses",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --noEmit false --emitDeclarationOnly false --pretty",
+    "lint:types": "tsc -b",
+    "test": "vitest run",
+    "test:unit": "node --experimental-strip-types scripts/run-unit-tests.mjs",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "playwright test",
+    "db:start": "supabase start",
+    "db:stop": "supabase stop",
+    "db:reset": "supabase db reset",
+    "db:push": "supabase db push",
+    "db:test": "supabase test db",
+    "db:seed": "supabase db reset --db-url \"$SUPABASE_DB_URL\""
+  },
+  "dependencies": {
+    "@hookform/resolvers": "^5.9.2",
+    "@supabase/supabase-js": "^2.118.0",
+    "@tanstack/react-query": "^5.105.0",
+    "@tanstack/react-table": "^8.21.3",
+    "@testing-library/dom": "^10.4.1",
+    "lucide-react": "^0.577.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-hook-form": "^7.91.0",
+    "react-router-dom": "^7.18.5",
+    "recharts": "^3.10.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "@testing-library/jest-dom": "^6.10.0",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.8",
+    "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "jsdom": "^26.1.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.5",
+    "vitest": "^4.1.12"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

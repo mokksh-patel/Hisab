@@ -1,0 +1,73 @@
+# ===========================================================================
+# BizPilot — local Supabase configuration
+#
+# Used by `supabase start`, `supabase db reset` and `supabase test db`.
+# These settings apply to the LOCAL stack only. The linked hosted project is
+# configured through the Supabase dashboard, not this file.
+#
+# Ports are the Supabase defaults so the values in .env.example line up.
+# ===========================================================================
+
+project_id = "bizpilot"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 17
+
+[db.pooler]
+enabled = false
+port = 54329
+pool_mode = "transaction"
+default_pool_size = 20
+max_client_conn = 100
+
+[studio]
+enabled = true
+port = 54323
+api_url = "http://127.0.0.1"
+
+[inbucket]
+enabled = true
+port = 54324
+
+[storage]
+enabled = true
+file_size_limit = "50MiB"
+
+[auth]
+enabled = true
+site_url = "http://localhost:5173"
+additional_redirect_urls = [
+  "http://localhost:5173/auth/callback",
+  "http://localhost:5173/auth/reset-password",
+]
+jwt_expiry = 3600
+enable_signup = true
+
+# Email confirmation is disabled locally so the test suite and manual
+# development do not require reading a mailbox. Production MUST keep this on.
+[auth.email]
+enable_signup = true
+double_confirm_changes = true
+enable_confirmations = false
+
+[auth.sms]
+enable_signup = false
+
+[analytics]
+enabled = false
+
+# ---------------------------------------------------------------------------
+# Test database
+#
+# `supabase test db` runs every .sql file in supabase/tests against the local
+# database. pgTAP is available in the `extensions` schema.
+# ---------------------------------------------------------------------------
