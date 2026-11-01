@@ -179,6 +179,7 @@ import { resolve } from 'node:path';
 export interface E2EAccounts {
   primary: TestAccount;
   secondary: TestAccount;
+  resilience: TestAccount;
 }
 
 /** Loads the accounts created by global-setup. Throws if setup did not run. */

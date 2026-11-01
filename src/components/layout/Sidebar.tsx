@@ -59,7 +59,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
           'transition-transform duration-200 lg:translate-x-0',
           open ? 'translate-x-0' : '-translate-x-full',
         )}
-        aria-label="Main navigation"
+        aria-label="Sidebar"
       >
         <div className="flex h-16 items-center justify-between border-b border-line px-5">
           <div className="flex items-center gap-2">
@@ -81,7 +81,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
           </button>
         </div>
 
-        <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-4">
+        <nav aria-label="Main navigation" className="flex-1 space-y-1 overflow-y-auto px-3 py-4">
           {NAV_ITEMS.map((item) => (
             <NavLink
               key={item.to}

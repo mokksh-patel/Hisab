@@ -6,7 +6,12 @@ import App from './App';
 import { ToastProvider } from '@/components/ui/Toast';
 import { AuthProvider } from '@/context/AuthContext';
 import { BusinessProvider } from '@/context/BusinessContext';
+import { ErrorBoundary } from '@/components/layout/ErrorBoundary';
+import { installGlobalErrorHandlers, reportError } from '@/lib/monitoring';
 import './styles/index.css';
+
+// Capture uncaught errors and unhandled promise rejections before React mounts.
+installGlobalErrorHandlers();
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -17,6 +22,12 @@ const queryClient = new QueryClient({
       retry: 1,
       refetchOnWindowFocus: true,
     },
+    mutations: {
+      onError: (error) => {
+        // Mutations are financial writes; every failure is worth recording.
+        reportError(error, { context: 'mutation' });
+      },
+    },
   },
 });
 
@@ -25,16 +36,18 @@ if (!rootElement) throw new Error('Root element #root not found in index.html');
 
 createRoot(rootElement).render(
   <StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <ToastProvider>
-          <AuthProvider>
-            <BusinessProvider>
-              <App />
-            </BusinessProvider>
-          </AuthProvider>
-        </ToastProvider>
-      </BrowserRouter>
-    </QueryClientProvider>
+    <ErrorBoundary>
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>
+          <ToastProvider>
+            <AuthProvider>
+              <BusinessProvider>
+                <App />
+              </BusinessProvider>
+            </AuthProvider>
+          </ToastProvider>
+        </BrowserRouter>
+      </QueryClientProvider>
+    </ErrorBoundary>
   </StrictMode>,
 );

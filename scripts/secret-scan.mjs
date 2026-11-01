@@ -37,6 +37,9 @@ const ALLOWLIST = new Set([
   'BUILD_PROGRESS.md',
   'DEPLOYMENT.md',
   'BACKUP_AND_RECOVERY.md',
+  // Contains deliberately fake credentials used to prove the monitoring
+  // sanitiser redacts them. They are not real and never leave the test process.
+  'tests/unit/monitoring.test.ts',
 ]);
 
 const PATTERNS = [

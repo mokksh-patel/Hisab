@@ -53,11 +53,19 @@ jwt_expiry = 3600
 enable_signup = true
 
 # Email confirmation is disabled locally so the test suite and manual
-# development do not require reading a mailbox. Production MUST keep this on.
+# development do not require reading a mailbox.
+#
+# PRODUCTION MUST KEEP CONFIRMATIONS ENABLED. The hosted project is configured
+# through the dashboard (Authentication -> Providers -> Email), NOT by pushing
+# this file. See DEPLOYMENT.md for the production checklist.
 [auth.email]
 enable_signup = true
 double_confirm_changes = true
 enable_confirmations = false
+# Local development uses the built-in Inbucket mailbox on port 54324.
+# Production requires a custom SMTP provider — see DEPLOYMENT.md.
+max_frequency = "1s"
+otp_length = 6
 
 [auth.sms]
 enable_signup = false

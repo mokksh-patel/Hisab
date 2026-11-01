@@ -26,6 +26,7 @@ export const ACCOUNTS_FILE = resolve(process.cwd(), 'tests/e2e/.accounts.json');
 export interface E2EAccounts {
   primary: TestAccount;
   secondary: TestAccount;
+  resilience: TestAccount;
 }
 
 function randomId(): string {
@@ -41,12 +42,16 @@ async function globalSetup(): Promise<void> {
   const stamp = randomId();
   const primaryEmail = `e2e+primary-${stamp}@example.com`;
   const secondaryEmail = `e2e+secondary-${stamp}@example.com`;
+  const resilienceEmail = `e2e+resilience-${stamp}@example.com`;
 
-  // Insert both users with a bcrypt hash of E2E_PASSWORD. `crypt(..., gen_salt('bf'))`
+  // Insert the users with a bcrypt hash of E2E_PASSWORD. `crypt(..., gen_salt('bf'))`
   // produces the same format GoTrue uses, so signInWithPassword works normally.
   //
   // GoTrue requires the token columns to be EMPTY STRINGS, not NULL — a NULL
   // there makes the auth server fail with "Database error querying schema".
+  //
+  // A dedicated `resilience` account exists so those tests never share business
+  // state with the auth/receivables suites. Shared state made results flaky.
   const sql = `
     insert into auth.users (
       instance_id, id, aud, role, email, encrypted_password,
@@ -69,7 +74,8 @@ async function globalSetup(): Promise<void> {
       '', '', '', '', '', '', '', ''
     from (values
       ('${primaryEmail}', 'E2E Primary'),
-      ('${secondaryEmail}', 'E2E Secondary')
+      ('${secondaryEmail}', 'E2E Secondary'),
+      ('${resilienceEmail}', 'E2E Resilience')
     ) as u(email, full_name)
     returning id, email;
   `;
@@ -83,18 +89,20 @@ async function globalSetup(): Promise<void> {
   const rows = parseRows(output);
   const primary = rows.find((row) => row.email === primaryEmail);
   const secondary = rows.find((row) => row.email === secondaryEmail);
+  const resilience = rows.find((row) => row.email === resilienceEmail);
 
-  if (!primary || !secondary) {
+  if (!primary || !secondary || !resilience) {
     throw new Error(`could not create e2e accounts. Output: ${output}`);
   }
 
   const accounts: E2EAccounts = {
     primary: { email: primaryEmail, password: E2E_PASSWORD, userId: primary.id },
     secondary: { email: secondaryEmail, password: E2E_PASSWORD, userId: secondary.id },
+    resilience: { email: resilienceEmail, password: E2E_PASSWORD, userId: resilience.id },
   };
 
   writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2), 'utf8');
-  console.log(`[e2e] created accounts: ${primaryEmail}, ${secondaryEmail}`);
+  console.log(`[e2e] created accounts: ${primaryEmail}, ${secondaryEmail}, ${resilienceEmail}`);
 }
 
 function parseRows(output: string): { id: string; email: string }[] {

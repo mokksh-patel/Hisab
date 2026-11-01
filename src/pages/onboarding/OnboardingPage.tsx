@@ -113,7 +113,10 @@ export function OnboardingPage() {
         defaultCreditPeriodDays: Number(values.defaultCreditPeriodDays),
       });
 
-      await queryClient.invalidateQueries({ queryKey: ['my-businesses'] });
+      // Refetch BEFORE selecting, so the context's "is this id valid?" effect
+      // sees the new business. Selecting first races the refetch: the effect
+      // runs against a stale list, decides the id is invalid, and overwrites it.
+      await queryClient.refetchQueries({ queryKey: ['my-businesses'] });
       selectBusiness(businessId);
       toast.success('Business created. Welcome to BizPilot.');
       navigate('/', { replace: true });

@@ -67,7 +67,12 @@ export function BusinessProvider({ children }: { children: ReactNode }) {
   // CREATED business. `listMyBusinesses` orders by created_at ascending, so the
   // newest is last. Choosing the newest is deterministic and matches what a user
   // expects right after onboarding.
+  //
+  // IMPORTANT: this must not run while the list is still loading. During a
+  // refetch `businesses` can be stale (or empty), and acting on it would
+  // overwrite a selection the user just made — e.g. right after onboarding.
   useEffect(() => {
+    if (query.isFetching) return;
     if (businesses.length === 0) return;
     const stillValid = selectedId && businesses.some((b) => b.id === selectedId);
     if (!stillValid) {
@@ -79,7 +84,7 @@ export function BusinessProvider({ children }: { children: ReactNode }) {
         /* storage unavailable — selection stays in memory only */
       }
     }
-  }, [businesses, selectedId]);
+  }, [businesses, selectedId, query.isFetching]);
 
   const selectBusiness = useCallback((businessId: string) => {
     setSelectedId(businessId);
