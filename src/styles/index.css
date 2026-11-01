@@ -1,0 +1,120 @@
+@import 'tailwindcss';
+
+/* ==========================================================================
+   BizPilot design tokens
+   Restrained enterprise palette. Semantic colours are used consistently:
+     navy   -> primary actions, active navigation, headings
+     coral  -> overdue, warnings, "send reminder"
+     green  -> money received, paid
+     amber  -> due today / due soon
+     slate  -> neutral text and borders
+   ========================================================================== */
+
+@theme {
+  --color-navy-50: #eef1f9;
+  --color-navy-100: #d9e0f2;
+  --color-navy-200: #b3c1e5;
+  --color-navy-300: #8ca2d8;
+  --color-navy-400: #5f7cc4;
+  --color-navy-500: #3d5aa8;
+  --color-navy-600: #2c4488;
+  --color-navy-700: #1e2761;
+  --color-navy-800: #171e4b;
+  --color-navy-900: #101538;
+
+  --color-coral-50: #fff1f1;
+  --color-coral-100: #ffe0e1;
+  --color-coral-200: #ffc2c4;
+  --color-coral-300: #fd9a9d;
+  --color-coral-400: #fb7a7e;
+  --color-coral-500: #f96167;
+  --color-coral-600: #e0444a;
+  --color-coral-700: #b8333a;
+
+  --color-success-50: #ecfdf5;
+  --color-success-100: #d1fae5;
+  --color-success-500: #10b981;
+  --color-success-600: #059669;
+  --color-success-700: #047857;
+
+  --color-warning-50: #fffbeb;
+  --color-warning-100: #fef3c7;
+  --color-warning-500: #f59e0b;
+  --color-warning-600: #d97706;
+  --color-warning-700: #b45309;
+
+  --color-page: #f3f6fc;
+  --color-surface: #ffffff;
+  --color-ink: #1f2937;
+  --color-muted: #6b7280;
+  --color-line: #e5e7eb;
+
+  --font-sans: 'Inter', system-ui, 'Segoe UI', Roboto, sans-serif;
+
+  --radius-card: 0.75rem;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--color-page);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Money must align in columns. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Visible focus ring for keyboard users (WCAG 2.4.7). */
+  :focus-visible {
+    outline: 2px solid var(--color-navy-500);
+    outline-offset: 2px;
+  }
+
+  /* Minimum 44px tap targets on touch devices. */
+  @media (pointer: coarse) {
+    button,
+    a[role='button'],
+    [data-tap-target] {
+      min-height: 44px;
+    }
+  }
+}
+
+@layer components {
+  .card {
+    background-color: var(--color-surface);
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius-card);
+  }
+
+  .skeleton {
+    background: linear-gradient(90deg, #eef1f6 25%, #e3e8f0 37%, #eef1f6 63%);
+    background-size: 400% 100%;
+    animation: skeleton-shimmer 1.4s ease infinite;
+    border-radius: 0.375rem;
+  }
+
+  @keyframes skeleton-shimmer {
+    0% {
+      background-position: 100% 50%;
+    }
+    100% {
+      background-position: 0 50%;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .skeleton {
+      animation: none;
+    }
+  }
+}

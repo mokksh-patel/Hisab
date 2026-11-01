@@ -755,7 +755,104 @@ pilot-grade.
 
 ---
 
+## Phase 5 — infrastructure and reliability
+
+### Test results (executed)
+
+| Suite | Result |
+|---|---|
+| Playwright (desktop + mobile) | **42/42 passing**, 2 skipped |
+| Unit tests (Node runner) | **126/126 passing** |
+| pgTAP `01_security_test.sql` | **66/66 passing** |
+| pgTAP `02_view_isolation_test.sql` | **16/16 passing** |
+| TypeScript | **0 errors** |
+| Vite production build | **succeeds** |
+
+### Milestone 1 — Git ✅
+
+- Repository initialised on `main`, baseline commit `ad00f53`.
+- `.gitignore` hardened: env files, backups, test output, Supabase temp.
+- `.gitattributes` added for LF normalisation.
+- `scripts/secret-scan.mjs` — 118 files scanned, **0 findings**. Verified by
+  planting a fake `sb_secret_` key and confirming it was caught.
+- 106 files committed; `.env.local` and `tests/e2e/.accounts.json` excluded.
+
+**Not done:** no GitHub remote (needs the user's account). Instructions in
+`DEPLOYMENT.md` §1.
+
+### Milestone 2 — Email ⚠️ documented, not configured
+
+`DEPLOYMENT.md` covers SMTP, SPF, DKIM, DMARC and redirect allowlisting.
+
+**Finding:** `supabase config diff` shows the remote project has
+`additional_redirect_urls: []` — **empty**. Confirmation and reset links will
+fail until this is set.
+
+**Blocked:** SMTP requires a provider account and DNS access. No credentials
+were invented.
+
+### Milestone 3 — Backup and recovery ⚠️ manual works, automation does not
+
+**Verified findings:**
+
+| Check | Result |
+|---|---|
+| Supabase managed backups | ❌ `"backups": null` |
+| PITR | ❌ `"pitr_enabled": false` |
+| `supabase db dump` | ❌ requires Docker (unavailable) |
+
+**Built and actually run:**
+
+- `scripts/backup.mjs` — **360 rows across 11 tables**, SHA-256 checksums
+- `scripts/verify-backup.mjs` — **11/11 tables verified**
+- `scripts/restore-rehearsal.mjs` — **360/360 rows restored and verified**,
+  scratch schema dropped, source data confirmed intact
+
+**Not done:** no scheduling, no off-site storage, no failure alerts.
+
+### Milestone 4 — Error monitoring ✅
+
+- `src/lib/monitoring.ts` — sanitises JWTs, secret keys, emails, card numbers,
+  connection strings
+- `ErrorBoundary` — catches render errors, offers recovery
+- Global handlers for `error` and `unhandledrejection`
+- Wired into `main.tsx`, including mutation errors
+- **11 unit tests** prove no sensitive data leaks
+
+**Not done:** no remote endpoint (`VITE_ERROR_ENDPOINT` unset).
+
+### Milestone 5 — Remaining e2e tests ✅
+
+`tests/e2e/resilience.spec.ts` — **6/6 passing**: tablet layout, slow network,
+offline network, invalid session, unknown route, payment form.
+
+### Bugs found and fixed in Phase 5
+
+1. **`BusinessContext` clobbered the user's selection** (High). After onboarding
+   the effect ran against a stale list and overwrote the new business id,
+   bouncing the user back to onboarding. Fixed by skipping the effect while
+   `isFetching` and refetching before selecting.
+2. **`<nav>` had no accessible name** (Medium). The label was on the wrapping
+   `<aside>`, so the navigation landmark was unidentifiable. Fixed.
+3. **e2e tests shared business state** (test infra). Each test created a
+   business on the same account, making results order-dependent and flaky.
+   Fixed with a dedicated `resilience` account.
+
+### Milestones 6–7 — not started
+
+Application stability review and pilot documentation remain.
+
+---
+
 ## Next milestone
 
-Phase 3 — deployment checkpoint. Requires explicit user approval before
-`supabase db push` against the original project.
+Phase 6 — remaining pilot readiness work. The application is functionally
+complete and verified; the outstanding items are operational:
+
+- Custom SMTP provider and DNS (SPF/DKIM/DMARC)
+- Scheduled off-site backups with failure alerts
+- Redirect URL allowlist on the hosted project
+- Application stability review (Milestone 6)
+- Pilot documentation: admin guide, owner guide, incident response (Milestone 7)
+
+The original production project `gdhaszmgwowfxgxllpva` remains untouched.
