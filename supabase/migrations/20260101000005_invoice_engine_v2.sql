@@ -70,12 +70,23 @@ where is_gst_registered = true
 alter table public.businesses
   alter column gst_scheme set default 'unregistered';
 
--- A composition taxpayer cannot be GST-registered in the tax-invoice sense.
+-- A composition-scheme taxpayer IS GST-registered, but may not collect GST from
+-- customers or issue a tax invoice. The registration flag and the scheme must
+-- therefore agree:
+--   unregistered -> is_gst_registered = false
+--   regular      -> is_gst_registered = true
+--   composition  -> is_gst_registered = true
 alter table public.businesses
   drop constraint if exists businesses_composition_not_registered;
 alter table public.businesses
-  add constraint businesses_composition_not_registered
-  check (gst_scheme <> 'composition' or is_gst_registered = false);
+  drop constraint if exists businesses_gst_scheme_registration_consistent;
+alter table public.businesses
+  add constraint businesses_gst_scheme_registration_consistent
+  check (
+    (gst_scheme = 'unregistered' and is_gst_registered = false)
+    or (gst_scheme = 'regular' and is_gst_registered = true)
+    or (gst_scheme = 'composition' and is_gst_registered = true)
+  );
 
 comment on column public.businesses.gst_scheme is
   'GST registration category. unregistered = no GST; regular = may issue tax invoices; composition = may NOT issue tax invoices.';
@@ -226,14 +237,28 @@ begin
   end if;
 
   if p_gst_mode <> 'exempt' then
+    -- An unconfirmed scheme must be resolved before any GST is charged. This is
+    -- enforced server-side because a UI banner can be bypassed by calling the
+    -- RPC directly.
+    if coalesce(v_business.gst_scheme_needs_review, false) then
+      raise exception
+        'Your GST scheme has not been confirmed. Open Settings and confirm whether you are registered under the regular or composition scheme before issuing a tax invoice.'
+        using errcode = '22023';
+    end if;
+
     if v_business.gst_scheme = 'composition' then
       raise exception
-        'A composition-scheme business cannot issue a tax invoice. Use exempt supply or record a bill of supply.'
+        'A composition-scheme business cannot issue a tax invoice or collect GST. Bill of Supply is not yet supported — record this invoice as exempt supply.'
         using errcode = '22023';
     end if;
     if v_business.gst_scheme = 'unregistered' then
       raise exception
         'An unregistered business cannot charge GST. Use exempt supply for this invoice.'
+        using errcode = '22023';
+    end if;
+    if v_business.gst_scheme is null then
+      raise exception
+        'This business has no GST scheme set. Confirm it in Settings before issuing a tax invoice.'
         using errcode = '22023';
     end if;
   end if;
@@ -303,10 +328,16 @@ begin
     end if;
 
     -- Integer paise arithmetic with half-up rounding, mirroring money.ts.
+    --
+    -- PARITY NOTE: every division below uses integer operands so PostgreSQL
+    -- performs exact numeric division, never floating point. `round()` on a
+    -- numeric is half-up, matching `multiplyPaise()` in src/lib/money.ts.
+    -- Do not introduce `::float` or `/ 10000.0` here — that would drift from
+    -- the client by a paise on some inputs.
     v_gross := round(v_price * v_qty);
 
     if v_disc_type = 'percent' then
-      v_discount := round(v_gross * v_disc_value / 10000.0);
+      v_discount := round(v_gross * v_disc_value / 10000);
     elsif v_disc_type = 'fixed' then
       v_discount := v_disc_value;
       if v_discount > v_gross then
@@ -326,17 +357,17 @@ begin
         v_taxable := v_net;
         v_cgst := 0; v_sgst := 0; v_igst := 0; v_cess := 0;
       else
-        v_taxable := round(v_net * 10000.0 / (10000 + v_total_rate_bp));
+        v_taxable := round(v_net * 10000 / (10000 + v_total_rate_bp));
         v_total_tax := v_net - v_taxable;
 
         if p_gst_mode = 'inter_state' then
-          v_cess := round(v_total_tax * v_cess_bp / v_total_rate_bp::numeric);
+          v_cess := round(v_total_tax * v_cess_bp / v_total_rate_bp);
           v_igst := v_total_tax - v_cess;
           v_cgst := 0; v_sgst := 0;
         else
-          v_gst_portion := round(v_total_tax * v_tax_bp / v_total_rate_bp::numeric);
+          v_gst_portion := round(v_total_tax * v_tax_bp / v_total_rate_bp);
           v_cess := v_total_tax - v_gst_portion;
-          v_cgst := round(v_gst_portion * floor(v_tax_bp / 2.0) / v_tax_bp::numeric);
+          v_cgst := round(v_gst_portion * floor(v_tax_bp / 2.0) / v_tax_bp);
           v_sgst := v_gst_portion - v_cgst;
           v_igst := 0;
         end if;
@@ -345,12 +376,12 @@ begin
       v_taxable := v_net;
 
       if p_gst_mode = 'inter_state' then
-        v_igst := round(v_taxable * v_tax_bp / 10000.0);
+        v_igst := round(v_taxable * v_tax_bp / 10000);
         v_cgst := 0;
         v_sgst := 0;
       elsif p_gst_mode = 'intra_state' then
-        v_cgst := round(v_taxable * floor(v_tax_bp / 2.0) / 10000.0);
-        v_sgst := round(v_taxable * (v_tax_bp - floor(v_tax_bp / 2.0)) / 10000.0);
+        v_cgst := round(v_taxable * floor(v_tax_bp / 2.0) / 10000);
+        v_sgst := round(v_taxable * (v_tax_bp - floor(v_tax_bp / 2.0)) / 10000);
         v_igst := 0;
       else
         v_cgst := 0;
@@ -358,7 +389,7 @@ begin
         v_igst := 0;
       end if;
 
-      v_cess := round(v_taxable * v_cess_bp / 10000.0);
+      v_cess := round(v_taxable * v_cess_bp / 10000);
     end if;
 
     v_line_total := v_taxable + v_cgst + v_sgst + v_igst + v_cess;
@@ -390,19 +421,113 @@ begin
     v_cess_total := v_cess_total + v_cess;
   end loop;
 
-  -- Invoice-level discount: reduce the taxable base proportionally and scale
-  -- the tax components by the same ratio so the breakdown stays consistent.
+  -- Invoice-level discount.
+  --
+  -- PARITY NOTE: this must match `allocateInvoiceDiscount()` in
+  -- src/lib/invoiceCalculations.ts exactly. The discount is allocated across
+  -- lines in proportion to taxable value, with the rounding remainder given to
+  -- the line with the largest taxable value. Each line's tax is then recomputed
+  -- on its reduced base — we do NOT scale the aggregate tax by a ratio, because
+  -- that produces different paise than per-line recomputation.
   if v_invoice_discount > 0 then
     if v_invoice_discount > v_taxable_total then
       raise exception 'Invoice discount cannot exceed the taxable value'
         using errcode = '22023';
     end if;
 
-    v_cgst_total := round(v_cgst_total * (v_taxable_total - v_invoice_discount) / v_taxable_total);
-    v_sgst_total := round(v_sgst_total * (v_taxable_total - v_invoice_discount) / v_taxable_total);
-    v_igst_total := round(v_igst_total * (v_taxable_total - v_invoice_discount) / v_taxable_total);
-    v_cess_total := round(v_cess_total * (v_taxable_total - v_invoice_discount) / v_taxable_total);
-    v_taxable_total := v_taxable_total - v_invoice_discount;
+    declare
+      v_allocated numeric(20,0) := 0;
+      v_remainder numeric(20,0);
+      v_largest_id uuid;
+      v_item record;
+      v_reduction numeric(20,0);
+      v_new_taxable numeric(20,0);
+      v_new_cgst numeric(20,0);
+      v_new_sgst numeric(20,0);
+      v_new_igst numeric(20,0);
+      v_new_cess numeric(20,0);
+    begin
+      -- Pass 1: proportional allocation.
+      for v_item in
+        select id, taxable_amount_paise
+        from public.invoice_items
+        where invoice_id = v_invoice_id
+        order by line_number
+      loop
+        v_reduction := round(v_invoice_discount * v_item.taxable_amount_paise / v_taxable_total);
+        update public.invoice_items
+        set discount_paise = discount_paise + v_reduction
+        where id = v_item.id;
+        v_allocated := v_allocated + v_reduction;
+      end loop;
+
+      -- Pass 2: give the rounding remainder to the largest line.
+      v_remainder := v_invoice_discount - v_allocated;
+      if v_remainder <> 0 then
+        select id into v_largest_id
+        from public.invoice_items
+        where invoice_id = v_invoice_id
+        order by taxable_amount_paise desc, line_number asc
+        limit 1;
+
+        update public.invoice_items
+        set discount_paise = discount_paise + v_remainder
+        where id = v_largest_id;
+      end if;
+
+      -- Pass 3: recompute each line's taxable value and tax on the reduced base.
+      v_taxable_total := 0;
+      v_cgst_total := 0;
+      v_sgst_total := 0;
+      v_igst_total := 0;
+      v_cess_total := 0;
+
+      for v_item in
+        select id, gross_amount_paise, discount_paise, tax_rate_basis_points,
+               cgst_paise, sgst_paise, igst_paise, cess_paise, taxable_amount_paise
+        from public.invoice_items
+        where invoice_id = v_invoice_id
+        order by line_number
+      loop
+        v_new_taxable := v_item.gross_amount_paise - v_item.discount_paise;
+
+        if p_gst_mode = 'inter_state' then
+          v_new_igst := round(v_new_taxable * v_item.tax_rate_basis_points / 10000);
+          v_new_cgst := 0;
+          v_new_sgst := 0;
+        elsif p_gst_mode = 'intra_state' then
+          v_new_cgst := round(v_new_taxable * floor(v_item.tax_rate_basis_points / 2.0) / 10000);
+          v_new_sgst := round(v_new_taxable * (v_item.tax_rate_basis_points - floor(v_item.tax_rate_basis_points / 2.0)) / 10000);
+          v_new_igst := 0;
+        else
+          v_new_cgst := 0;
+          v_new_sgst := 0;
+          v_new_igst := 0;
+        end if;
+
+        -- Cess keeps its original ratio to the taxable value.
+        v_new_cess := case
+          when v_item.taxable_amount_paise > 0
+            then round(v_item.cess_paise * v_new_taxable / v_item.taxable_amount_paise)
+          else 0
+        end;
+
+        update public.invoice_items
+        set taxable_amount_paise = v_new_taxable,
+            cgst_paise = v_new_cgst,
+            sgst_paise = v_new_sgst,
+            igst_paise = v_new_igst,
+            cess_paise = v_new_cess,
+            line_total_paise = v_new_taxable + v_new_cgst + v_new_sgst + v_new_igst + v_new_cess
+        where id = v_item.id;
+
+        v_taxable_total := v_taxable_total + v_new_taxable;
+        v_cgst_total := v_cgst_total + v_new_cgst;
+        v_sgst_total := v_sgst_total + v_new_sgst;
+        v_igst_total := v_igst_total + v_new_igst;
+        v_cess_total := v_cess_total + v_new_cess;
+      end loop;
+    end;
   end if;
 
   v_total := v_taxable_total + v_cgst_total + v_sgst_total + v_igst_total + v_cess_total;
@@ -436,6 +561,69 @@ $$;
 
 revoke all on function public.create_invoice(uuid, uuid, date, date, text, text, jsonb, text, text, boolean, numeric) from public;
 grant execute on function public.create_invoice(uuid, uuid, date, date, text, text, jsonb, text, text, boolean, numeric) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- confirm_gst_scheme
+--   The owner explicitly confirms the business's GST scheme. This clears the
+--   migration review flag and is the ONLY way to unblock tax-invoice issuance
+--   for a business whose scheme was inferred during the upgrade.
+--
+--   Authorisation: owner or admin only (assert_can_manage). A read-only or
+--   accountant member cannot change the tax registration category.
+-- ---------------------------------------------------------------------------
+create or replace function public.confirm_gst_scheme(
+  p_business_id uuid,
+  p_scheme public.gst_scheme
+)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $
+declare
+  v_previous public.gst_scheme;
+  v_previous_review boolean;
+begin
+  perform public.assert_can_manage(p_business_id);
+
+  if p_scheme is null then
+    raise exception 'A GST scheme is required' using errcode = '22023';
+  end if;
+
+  select gst_scheme, gst_scheme_needs_review
+    into v_previous, v_previous_review
+  from public.businesses
+  where id = p_business_id;
+
+  if not found then
+    raise exception 'Business not found' using errcode = 'P0002';
+  end if;
+
+  -- Keep is_gst_registered consistent with the chosen scheme. The table CHECK
+  -- constraint enforces this too; setting both here keeps the error message
+  -- meaningful rather than surfacing a raw constraint violation.
+  update public.businesses
+  set gst_scheme = p_scheme,
+      is_gst_registered = (p_scheme <> 'unregistered'),
+      gst_scheme_needs_review = false
+  where id = p_business_id;
+
+  perform public.write_audit_log(
+    p_business_id, 'business', p_business_id, 'settings.updated',
+    jsonb_build_object(
+      'gst_scheme', v_previous,
+      'gst_scheme_needs_review', v_previous_review
+    ),
+    jsonb_build_object(
+      'gst_scheme', p_scheme,
+      'gst_scheme_needs_review', false
+    )
+  );
+end;
+$;
+
+revoke all on function public.confirm_gst_scheme(uuid, public.gst_scheme) from public;
+grant execute on function public.confirm_gst_scheme(uuid, public.gst_scheme) to authenticated;
 
 -- Keep the old 9-argument signature working for any caller that has not been
 -- updated. It simply forwards to the new function with the defaults.

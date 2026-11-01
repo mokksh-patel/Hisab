@@ -406,10 +406,12 @@ export function calculateInvoiceTotals(
     const allocations = allocateInvoiceDiscount(computed, invoiceDiscountPaise);
     appliedInvoiceDiscount = sumPaise(allocations);
 
+    // PARITY NOTE: this must match the invoice-discount block in
+    // public.create_invoice() (migration 0005). Every line is recomputed, even
+    // when its allocation is zero, because the database does the same — a
+    // skipped line would keep its pre-discount tax and drift from the server.
     finalLines = computed.map((line, index) => {
       const reduction = allocations[index]!;
-      if (reduction === 0n) return line;
-
       const newTaxable = line.taxableAmountPaise - reduction;
       const totalRateBp = line.taxRateBasisPoints;
 
@@ -434,6 +436,7 @@ export function calculateInvoiceTotals(
 
       return {
         ...line,
+        discountPaise: line.discountPaise + reduction,
         taxableAmountPaise: newTaxable,
         cgstPaise: cgst,
         sgstPaise: sgst,

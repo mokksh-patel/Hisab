@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useBusiness } from '@/context/BusinessContext';
-import { updateBusiness } from '@/services/businessService';
+import { confirmGstScheme, updateBusiness } from '@/services/businessService';
 import { toAppError } from '@/lib/errors';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Button } from '@/components/ui/Button';
@@ -38,10 +38,15 @@ export default function SettingsPage() {
         legal_name: legalName.trim(),
         invoice_prefix: invoicePrefix.trim().toUpperCase(),
         default_credit_period_days: Number(creditDays),
-        gst_scheme: gstScheme,
-        // Confirming the scheme clears the migration review flag.
-        gst_scheme_needs_review: false,
       });
+
+      // The GST scheme goes through a dedicated RPC so the server can enforce
+      // owner/admin authorisation, keep is_gst_registered consistent, clear the
+      // review flag and write an audit record.
+      if (gstScheme !== currentBusiness!.gst_scheme || currentBusiness!.gst_scheme_needs_review) {
+        await confirmGstScheme(currentBusiness!.id, gstScheme);
+      }
+
       toast.success('Settings saved.');
       await queryClient.invalidateQueries({ queryKey: ['my-businesses'] });
     } catch (err) {

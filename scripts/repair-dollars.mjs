@@ -9,6 +9,7 @@ const DOUBLE = DOLLAR + DOLLAR;
 const files = [
   'supabase/tests/01_security_test.sql',
   'supabase/tests/02_view_isolation_test.sql',
+  'supabase/tests/03_invoice_engine_v2_test.sql',
 ];
 
 for (const file of files) {

@@ -4,7 +4,7 @@
 
 import { supabase } from '@/lib/supabase';
 import { unwrap } from '@/lib/errors';
-import type { Business, BusinessMember, MemberRole, Profile } from '@/types/database';
+import type { Business, BusinessMember, GstScheme, MemberRole, Profile } from '@/types/database';
 
 export interface BusinessWithRole extends Business {
   role: MemberRole;
@@ -83,6 +83,23 @@ export async function updateBusiness(
   return unwrap(
     await supabase.from('businesses').update(patch).eq('id', businessId).select('*').single(),
   ) as Business;
+}
+
+/**
+ * Confirms the business's GST scheme.
+ *
+ * This goes through a dedicated RPC rather than a direct UPDATE because the
+ * server must enforce owner/admin authorisation, keep `is_gst_registered`
+ * consistent with the scheme, clear the migration review flag and write an
+ * audit record. A direct UPDATE would bypass all of that.
+ */
+export async function confirmGstScheme(businessId: string, scheme: GstScheme): Promise<void> {
+  unwrap(
+    await supabase.rpc('confirm_gst_scheme', {
+      p_business_id: businessId,
+      p_scheme: scheme,
+    }),
+  );
 }
 
 export async function listMembers(businessId: string): Promise<BusinessMember[]> {

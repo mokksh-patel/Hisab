@@ -12,7 +12,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = public, extensions;
 
-select plan(30);
+select plan(37);
 
 -- ---------------------------------------------------------------------------
 -- Fixtures
@@ -79,20 +79,29 @@ $$;
 insert into public.businesses (id, legal_name, display_name, state_code, invoice_prefix, is_gst_registered, gst_scheme)
 values
   ('c0000000-0000-0000-0000-00000000000a', 'V2 Regular Pvt Ltd', 'V2 Regular', '24', 'V2R', true, 'regular'),
-  ('c0000000-0000-0000-0000-00000000000b', 'V2 Composition LLP', 'V2 Composition', '24', 'V2C', false, 'composition'),
-  ('c0000000-0000-0000-0000-00000000000c', 'V2 Unregistered', 'V2 Unregistered', '24', 'V2U', false, 'unregistered');
+  -- A composition taxpayer IS GST-registered; it simply may not collect GST.
+  ('c0000000-0000-0000-0000-00000000000b', 'V2 Composition LLP', 'V2 Composition', '24', 'V2C', true, 'composition'),
+  ('c0000000-0000-0000-0000-00000000000c', 'V2 Unregistered', 'V2 Unregistered', '24', 'V2U', false, 'unregistered'),
+  -- A business whose scheme was inferred during migration and not yet confirmed.
+  ('c0000000-0000-0000-0000-00000000000d', 'V2 Unconfirmed', 'V2 Unconfirmed', '24', 'V2X', true, 'regular');
+
+update public.businesses
+set gst_scheme_needs_review = true
+where id = 'c0000000-0000-0000-0000-00000000000d';
 
 insert into public.business_members (business_id, user_id, role, invitation_status)
 values
   ('c0000000-0000-0000-0000-00000000000a', 'c1111111-1111-1111-1111-111111111111', 'owner', 'accepted'),
   ('c0000000-0000-0000-0000-00000000000b', 'c1111111-1111-1111-1111-111111111111', 'owner', 'accepted'),
-  ('c0000000-0000-0000-0000-00000000000c', 'c1111111-1111-1111-1111-111111111111', 'owner', 'accepted');
+  ('c0000000-0000-0000-0000-00000000000c', 'c1111111-1111-1111-1111-111111111111', 'owner', 'accepted'),
+  ('c0000000-0000-0000-0000-00000000000d', 'c1111111-1111-1111-1111-111111111111', 'owner', 'accepted');
 
 insert into public.customers (id, business_id, customer_name, state_code)
 values
   ('c0000000-0000-0000-0000-0000000000c1', 'c0000000-0000-0000-0000-00000000000a', 'V2 Customer', '24'),
   ('c0000000-0000-0000-0000-0000000000c2', 'c0000000-0000-0000-0000-00000000000b', 'V2 Comp Customer', '24'),
-  ('c0000000-0000-0000-0000-0000000000c3', 'c0000000-0000-0000-0000-00000000000c', 'V2 Unreg Customer', '24');
+  ('c0000000-0000-0000-0000-0000000000c3', 'c0000000-0000-0000-0000-00000000000c', 'V2 Unreg Customer', '24'),
+  ('c0000000-0000-0000-0000-0000000000c4', 'c0000000-0000-0000-0000-00000000000d', 'V2 Unconfirmed Customer', '24');
 
 set local role authenticated;
 set local request.jwt.claims = '{"sub":"c1111111-1111-1111-1111-111111111111","role":"authenticated"}';
@@ -275,6 +284,28 @@ select throws_ok(
 -- ===========================================================================
 -- 5. GST scheme guards
 -- ===========================================================================
+select is(
+  (select is_gst_registered from public.businesses where id = 'c0000000-0000-0000-0000-00000000000b'),
+  true,
+  'a composition taxpayer IS GST-registered'
+);
+
+select throws_ok(
+  $$ insert into public.businesses (legal_name, display_name, is_gst_registered, gst_scheme)
+     values ('Bad Co', 'Bad Co', false, 'composition') $$,
+  '23514',
+  null,
+  'composition scheme with is_gst_registered = false is rejected by the constraint'
+);
+
+select throws_ok(
+  $$ insert into public.businesses (legal_name, display_name, is_gst_registered, gst_scheme)
+     values ('Bad Co 2', 'Bad Co 2', false, 'regular') $$,
+  '23514',
+  null,
+  'regular scheme with is_gst_registered = false is rejected by the constraint'
+);
+
 select throws_ok(
   $$ select public.create_invoice(
        'c0000000-0000-0000-0000-00000000000b',
@@ -308,6 +339,43 @@ select throws_ok(
   '22023',
   null,
   'an unregistered business cannot charge GST'
+);
+
+-- ===========================================================================
+-- 5b. Unconfirmed GST scheme is rejected server-side
+-- ===========================================================================
+select throws_ok(
+  $$ select public.create_invoice(
+       'c0000000-0000-0000-0000-00000000000d',
+       'c0000000-0000-0000-0000-0000000000c4',
+       '2026-10-01', '2026-10-31', 'intra_state', '24',
+       '[{"description":"Widget","quantity":"1","unit_price_paise":"1000","tax_rate_basis_points":1800}]'::jsonb
+     ) $$,
+  '22023',
+  null,
+  'an unconfirmed GST scheme blocks tax-invoice issuance'
+);
+
+select lives_ok(
+  $$ select public.confirm_gst_scheme('c0000000-0000-0000-0000-00000000000d', 'regular') $$,
+  'the owner can confirm the GST scheme'
+);
+
+select is(
+  (select gst_scheme_needs_review from public.businesses where id = 'c0000000-0000-0000-0000-00000000000d'),
+  false,
+  'confirming the scheme clears the review flag'
+);
+
+select lives_ok(
+  $$ select public.create_invoice(
+       'c0000000-0000-0000-0000-00000000000d',
+       'c0000000-0000-0000-0000-0000000000c4',
+       '2026-10-01', '2026-10-31', 'intra_state', '24',
+       '[{"description":"Widget","quantity":"1","unit_price_paise":"1000","tax_rate_basis_points":1800}]'::jsonb,
+       null, 'V2-CONFIRMED-001'
+     ) $$,
+  'a tax invoice can be issued after the scheme is confirmed'
 );
 
 -- ===========================================================================
