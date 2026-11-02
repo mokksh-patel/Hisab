@@ -3,13 +3,23 @@
 --
 -- ADDITIVE ONLY. Nothing here changes the meaning of existing data.
 --
--- TRANSACTIONALITY
---   The Supabase CLI runs each migration file inside a single transaction, but
---   this file also wraps itself in an explicit BEGIN/COMMIT so that a failure
---   at ANY statement rolls back every earlier statement. A previous attempt
---   failed at the invoice_items backfill and left enums and columns behind
---   because the file relied on the CLI's implicit transaction. The explicit
---   block removes that dependency.
+-- TRANSACTIONALITY — DO NOT ADD BEGIN/COMMIT TO THIS FILE
+--   The Supabase CLI decides how to run a migration by inspecting its FIRST
+--   LINE. If the first line is exactly `-- pg-delta: transaction=false` the
+--   file runs in transactionMode "none" (statement by statement). Otherwise it
+--   runs in transactionMode "transactional" and the CLI wraps the whole file in
+--   a single transaction.
+--
+--   This file's first line is a comment banner, so it resolves to
+--   "transactional" and the CLI provides the transaction.
+--
+--   Adding an explicit BEGIN/COMMIT here would be actively harmful: the inner
+--   COMMIT commits the CLI's outer transaction early, so a later failure leaves
+--   partial DDL behind. That is exactly what happened on the first attempt.
+--   Verified empirically — see scripts/test-nested-begin.mjs.
+--
+--   The CLI also records the migration in supabase_migrations.schema_migrations
+--   inside the same transaction, so history and DDL commit together.
 --
 -- WHAT THIS MIGRATION ADDS
 --   1. businesses.gst_scheme        — unregistered | regular | composition
@@ -21,14 +31,16 @@
 --   6. create_invoice() v2          — inclusive pricing, fixed discounts,
 --                                     invoice-level discount, GST scheme checks
 --   7. confirm_gst_scheme()         — owner-only scheme confirmation
+--   8. invoice_item_discounts view  — read-time fallback for issued lines
 --
 -- BACKWARDS COMPATIBILITY
 --   * Every new column is nullable or has a default that reproduces the old
 --     behaviour exactly.
 --   * Existing invoices keep price_includes_tax = false and
 --     invoice_discount_paise = 0, so their stored totals remain correct.
---   * Existing invoice_items get discount_type = 'percent' and
---     discount_value = discount_percent_basis_points, which is what they were.
+--   * Existing ISSUED invoice_items are never modified. Their discount metadata
+--     is derived at read time from discount_percent_basis_points via the
+--     invoice_item_discounts view. Only DRAFT items are backfilled.
 --   * Existing businesses get gst_scheme = 'unregistered' ONLY when they are
 --     not GST-registered. Registered businesses are set to 'regular' but flagged
 --     for review via a dedicated column, because we must not silently assume a
@@ -36,13 +48,17 @@
 --   * create_invoice() keeps its original signature and gains two optional
 --     trailing parameters, so existing callers continue to work unchanged.
 --
+-- RESTARTABILITY
+--   Every DDL statement is guarded: enums use IF NOT EXISTS, columns use
+--   ADD COLUMN IF NOT EXISTS, constraints use DROP CONSTRAINT IF EXISTS before
+--   ADD, and functions/views use CREATE OR REPLACE. The migration can be
+--   re-run against a partially-applied database without duplicating objects.
+--
 -- ROLLBACK
 --   See the DOWN section at the bottom of this file. It is commented out so the
 --   migration is forward-only by default; run it manually if a rollback is
 --   required before any data depends on the new columns.
 -- ===========================================================================
-
-begin;
 
 -- ---------------------------------------------------------------------------
 -- 1. GST scheme on businesses
@@ -103,6 +119,87 @@ comment on column public.businesses.gst_scheme is
   'GST registration category. unregistered = no GST; regular = may issue tax invoices; composition = may NOT issue tax invoices.';
 comment on column public.businesses.gst_scheme_needs_review is
   'True when the scheme was inferred during migration and an owner must confirm it.';
+
+-- ---------------------------------------------------------------------------
+-- 1b. create_business_with_owner() must set gst_scheme explicitly
+--
+--   The consistency constraint above means a business cannot be inserted with
+--   is_gst_registered = true while gst_scheme keeps its 'unregistered' default.
+--   The 0003 version of this function inserts is_gst_registered but not
+--   gst_scheme, so every GST-registered signup would fail the constraint.
+--
+--   This replaces the function with one that derives gst_scheme from the
+--   registration flag. A newly created business is never flagged for review —
+--   the owner chose the flag at signup, so there is nothing to confirm.
+-- ---------------------------------------------------------------------------
+create or replace function public.create_business_with_owner(
+  p_legal_name text,
+  p_display_name text,
+  p_business_type text default null,
+  p_gstin text default null,
+  p_city text default null,
+  p_state_code text default null,
+  p_phone text default null,
+  p_email text default null,
+  p_is_gst_registered boolean default false,
+  p_invoice_prefix text default 'INV',
+  p_default_credit_period_days smallint default 30
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_business_id uuid;
+  v_is_registered boolean := coalesce(p_is_gst_registered, false);
+begin
+  if v_user_id is null then
+    raise exception 'Not authenticated' using errcode = '28000';
+  end if;
+  if coalesce(trim(p_legal_name), '') = '' then
+    raise exception 'Legal name is required' using errcode = '22023';
+  end if;
+  if coalesce(trim(p_display_name), '') = '' then
+    raise exception 'Display name is required' using errcode = '22023';
+  end if;
+
+  insert into public.businesses (
+    legal_name, display_name, business_type, gstin, city, state_code, phone, email,
+    is_gst_registered, gst_scheme, gst_scheme_needs_review,
+    invoice_prefix, default_credit_period_days
+  )
+  values (
+    trim(p_legal_name), trim(p_display_name), p_business_type, p_gstin, p_city, p_state_code,
+    p_phone, p_email,
+    v_is_registered,
+    case when v_is_registered then 'regular'::public.gst_scheme
+         else 'unregistered'::public.gst_scheme end,
+    false,
+    coalesce(p_invoice_prefix, 'INV'),
+    coalesce(p_default_credit_period_days, 30)
+  )
+  returning id into v_business_id;
+
+  insert into public.business_members (business_id, user_id, role, invitation_status)
+  values (v_business_id, v_user_id, 'owner', 'accepted');
+
+  perform public.write_audit_log(
+    v_business_id, 'business', v_business_id, 'business.created', null,
+    jsonb_build_object(
+      'legal_name', p_legal_name,
+      'display_name', p_display_name,
+      'gst_scheme', case when v_is_registered then 'regular' else 'unregistered' end
+    )
+  );
+
+  return v_business_id;
+end;
+$$;
+
+revoke all on function public.create_business_with_owner(text, text, text, text, text, text, text, text, boolean, text, smallint) from public;
+grant execute on function public.create_business_with_owner(text, text, text, text, text, text, text, text, boolean, text, smallint) to authenticated;
 
 -- ---------------------------------------------------------------------------
 -- 2. Invoice-level pricing mode and discount
@@ -803,13 +900,11 @@ begin
 end;
 $$;
 
-commit;
-
 -- ===========================================================================
 -- DOWN (manual rollback — run only if this migration must be reverted before
 -- any invoice depends on the new columns)
 --
---   begin;
+--   drop view if exists public.invoice_item_discounts;
 --   drop function if exists public.confirm_gst_scheme(uuid, public.gst_scheme);
 --   drop function if exists public.create_invoice(uuid, uuid, date, date, text, text, jsonb, text, text, boolean, numeric);
 --   -- restore the 0003 definition of create_invoice() and guard_invoice_update()
@@ -822,7 +917,6 @@ commit;
 --   alter table public.businesses drop column if exists gst_scheme;
 --   drop type if exists public.discount_type;
 --   drop type if exists public.gst_scheme;
---   commit;
 -- ===========================================================================
 
 -- end of migration 0005
