@@ -28,6 +28,12 @@ import { existsSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { E2E_PASSWORD, type TestAccount } from './fixtures';
 import { readE2EConfig } from './env';
+import { buildFailureDiagnostic } from './diagnostics';
+import {
+  PGCRYPTO_SCHEMA_QUERY,
+  buildPasswordHashExpression,
+  parsePgcryptoSchema,
+} from './pgcrypto';
 
 export const ACCOUNTS_FILE = resolve(process.cwd(), 'tests/e2e/.accounts.json');
 
@@ -79,40 +85,6 @@ function randomId(): string {
 }
 
 /**
- * Redacts anything sensitive from CLI/Postgres output before it is reported.
- *
- * The goal is a diagnostic that is useful in a CI log without leaking secrets
- * or the SQL statement. Applied to stderr and stdout alike.
- */
-export function redactDiagnostic(text: string): string {
-  let out = text;
-
-  // Generated E2E email addresses (e2e+<label>-<stamp>@example.com).
-  out = out.replace(/e2e\+[^\s'"@]*@[^\s'"]*/gi, '<redacted-email>');
-
-  // Any other email address.
-  out = out.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '<redacted-email>');
-
-  // bcrypt hashes ($2a$/$2b$/$2y$...) and any other crypt() output.
-  out = out.replace(/\$2[aby]?\$\d{2}\$[./A-Za-z0-9]{53}/g, '<redacted-hash>');
-
-  // JWTs (three base64url segments) — covers anon, service-role and any token.
-  out = out.replace(/eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*/g, '<redacted-jwt>');
-
-  // Supabase publishable/secret keys.
-  out = out.replace(/sb_(publishable|secret)_[A-Za-z0-9_-]+/g, '<redacted-key>');
-
-  // Connection strings / passwords.
-  out = out.replace(/postgres(ql)?:\/\/[^\s'"]+/gi, '<redacted-db-url>');
-  out = out.replace(/(password|passwd|pwd)\s*=\s*[^\s'";]+/gi, '$1=<redacted>');
-
-  // The E2E password constant, in case it ever appears verbatim.
-  out = out.split(E2E_PASSWORD).join('<redacted-password>');
-
-  return out;
-}
-
-/**
  * Runs `supabase db query --local` and returns its stdout.
  *
  * Uses spawnSync (not execFileSync) so a non-zero exit does not throw away
@@ -152,14 +124,9 @@ function runLocalQuery(sql: string): string {
   }
 
   if (result.status !== 0) {
-    // Report the exit status and the CLI/Postgres message, redacted. The SQL
-    // statement itself is never printed.
-    const detail = redactDiagnostic(stderr.trim() || stdout.trim() || '<no output>');
-    throw new Error(
-      `[e2e] seeding synthetic auth users failed (exit status ${result.status}).\n` +
-        `--- supabase db query --local output (redacted) ---\n${detail}\n` +
-        '--- end output ---',
-    );
+    // Both streams are reported independently and redacted. The SQL statement
+    // itself is never printed.
+    throw new Error(buildFailureDiagnostic(result.status, stdout, stderr));
   }
 
   return stdout;
@@ -176,17 +143,23 @@ async function globalSetup(): Promise<void> {
   const resilienceEmail = `e2e+resilience-${stamp}@example.com`;
   const onboardingEmail = `e2e+onboarding-${stamp}@example.com`;
 
-  // Insert the users with a bcrypt hash of E2E_PASSWORD.
-  // `extensions.crypt(..., extensions.gen_salt('bf'))` produces the same format
-  // GoTrue uses, so signInWithPassword works normally.
+  // Discover where pgcrypto actually lives before building the seed statement.
   //
-  // WHY THE `extensions.` PREFIX IS REQUIRED:
-  // Supabase installs pgcrypto into the `extensions` schema, not `public`. The
-  // `db query` session's search_path does not include `extensions` (the pgTAP
-  // suites have to `set local search_path = public, extensions` for the same
-  // reason), so an unqualified `crypt(...)` fails with
-  // "function crypt(unknown, unknown) does not exist". Qualifying the calls
-  // makes the statement independent of the session search_path.
+  // The extension schema is NOT guaranteed to be `public` or `extensions`; it
+  // depends on how the database was provisioned. Hard-coding either name
+  // produced `function extensions.crypt(unknown, unknown) does not exist`
+  // (SQLSTATE 42883) on the real local stack. The catalog is the only
+  // authoritative source, so it is queried through the same local-only helper.
+  const pgcryptoSchema = parsePgcryptoSchema(runLocalQuery(PGCRYPTO_SCHEMA_QUERY));
+
+  // Both crypt() and gen_salt() are pgcrypto functions, so both are qualified
+  // with the discovered schema. The schema name is validated as a PostgreSQL
+  // identifier before it reaches the SQL (see pgcrypto.ts).
+  const passwordHash = buildPasswordHashExpression(pgcryptoSchema, E2E_PASSWORD);
+
+  // Insert the users with a bcrypt hash of E2E_PASSWORD. The expression
+  // produces the same format GoTrue stores, so signInWithPassword works
+  // normally.
   //
   // GoTrue requires the token columns to be EMPTY STRINGS, not NULL — a NULL
   // there makes the auth server fail with "Database error querying schema".
@@ -210,7 +183,7 @@ async function globalSetup(): Promise<void> {
       'authenticated',
       'authenticated',
       u.email,
-      extensions.crypt('${E2E_PASSWORD}', extensions.gen_salt('bf')),
+      ${passwordHash},
       now(), now(), now(),
       '{"provider":"email","providers":["email"]}'::jsonb,
       jsonb_build_object('full_name', u.full_name),
