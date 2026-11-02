@@ -121,17 +121,129 @@ comment on column public.businesses.gst_scheme_needs_review is
   'True when the scheme was inferred during migration and an owner must confirm it.';
 
 -- ---------------------------------------------------------------------------
--- 1b. create_business_with_owner() must set gst_scheme explicitly
+-- 1b. create_business_with_owner() — explicit GST scheme selection
 --
 --   The consistency constraint above means a business cannot be inserted with
 --   is_gst_registered = true while gst_scheme keeps its 'unregistered' default.
 --   The 0003 version of this function inserts is_gst_registered but not
 --   gst_scheme, so every GST-registered signup would fail the constraint.
 --
---   This replaces the function with one that derives gst_scheme from the
---   registration flag. A newly created business is never flagged for review —
---   the owner chose the flag at signup, so there is nothing to confirm.
+--   IMPORTANT: this function does NOT assume that a GST-registered business
+--   follows the regular scheme. A composition taxpayer is also GST-registered
+--   but may not collect GST or issue a tax invoice. Assuming 'regular' would
+--   let a composition business issue an invalid tax invoice.
+--
+--   The caller must therefore state the scheme explicitly:
+--
+--     p_gst_scheme = 'unregistered'  -> is_gst_registered forced to false
+--     p_gst_scheme = 'regular'       -> is_gst_registered forced to true,
+--                                       needs_review = false (explicit choice)
+--     p_gst_scheme = 'composition'   -> is_gst_registered forced to true,
+--                                       needs_review = false (explicit choice)
+--     p_gst_scheme = NULL            -> derived from p_is_gst_registered:
+--                                         false -> 'unregistered', no review
+--                                         true  -> 'regular' BUT
+--                                                  needs_review = true, so the
+--                                                  owner must confirm before any
+--                                                  tax invoice can be issued
+--
+--   The NULL branch is the backwards-compatible path for existing callers that
+--   only pass p_is_gst_registered. It never silently enables tax invoicing: a
+--   registered business created that way is flagged for review and blocked by
+--   the create_invoice() guard until confirmed.
 -- ---------------------------------------------------------------------------
+create or replace function public.create_business_with_owner(
+  p_legal_name text,
+  p_display_name text,
+  p_business_type text default null,
+  p_gstin text default null,
+  p_city text default null,
+  p_state_code text default null,
+  p_phone text default null,
+  p_email text default null,
+  p_is_gst_registered boolean default false,
+  p_invoice_prefix text default 'INV',
+  p_default_credit_period_days smallint default 30,
+  p_gst_scheme public.gst_scheme default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_business_id uuid;
+  v_scheme public.gst_scheme;
+  v_registered boolean;
+  v_needs_review boolean;
+begin
+  if v_user_id is null then
+    raise exception 'Not authenticated' using errcode = '28000';
+  end if;
+  if coalesce(trim(p_legal_name), '') = '' then
+    raise exception 'Legal name is required' using errcode = '22023';
+  end if;
+  if coalesce(trim(p_display_name), '') = '' then
+    raise exception 'Display name is required' using errcode = '22023';
+  end if;
+
+  if p_gst_scheme is not null then
+    -- Explicit choice: the scheme determines the registration flag.
+    v_scheme := p_gst_scheme;
+    v_registered := (p_gst_scheme <> 'unregistered');
+    v_needs_review := false;
+  else
+    -- Legacy path: only the registration flag was supplied.
+    if coalesce(p_is_gst_registered, false) then
+      -- We do NOT know whether this is regular or composition. Record the
+      -- common case but flag it so the owner must confirm before invoicing.
+      v_scheme := 'regular';
+      v_registered := true;
+      v_needs_review := true;
+    else
+      v_scheme := 'unregistered';
+      v_registered := false;
+      v_needs_review := false;
+    end if;
+  end if;
+
+  insert into public.businesses (
+    legal_name, display_name, business_type, gstin, city, state_code, phone, email,
+    is_gst_registered, gst_scheme, gst_scheme_needs_review,
+    invoice_prefix, default_credit_period_days
+  )
+  values (
+    trim(p_legal_name), trim(p_display_name), p_business_type, p_gstin, p_city, p_state_code,
+    p_phone, p_email,
+    v_registered, v_scheme, v_needs_review,
+    coalesce(p_invoice_prefix, 'INV'),
+    coalesce(p_default_credit_period_days, 30)
+  )
+  returning id into v_business_id;
+
+  insert into public.business_members (business_id, user_id, role, invitation_status)
+  values (v_business_id, v_user_id, 'owner', 'accepted');
+
+  perform public.write_audit_log(
+    v_business_id, 'business', v_business_id, 'business.created', null,
+    jsonb_build_object(
+      'legal_name', p_legal_name,
+      'display_name', p_display_name,
+      'gst_scheme', v_scheme,
+      'gst_scheme_needs_review', v_needs_review
+    )
+  );
+
+  return v_business_id;
+end;
+$$;
+
+revoke all on function public.create_business_with_owner(text, text, text, text, text, text, text, text, boolean, text, smallint, public.gst_scheme) from public;
+grant execute on function public.create_business_with_owner(text, text, text, text, text, text, text, text, boolean, text, smallint, public.gst_scheme) to authenticated;
+
+-- Keep the original 11-argument signature working. It forwards with a NULL
+-- scheme, which takes the legacy path above (registered -> flagged for review).
 create or replace function public.create_business_with_owner(
   p_legal_name text,
   p_display_name text,
@@ -146,57 +258,19 @@ create or replace function public.create_business_with_owner(
   p_default_credit_period_days smallint default 30
 )
 returns uuid
-language plpgsql
+language sql
 security definer
 set search_path = public, pg_temp
 as $$
-declare
-  v_user_id uuid := auth.uid();
-  v_business_id uuid;
-  v_is_registered boolean := coalesce(p_is_gst_registered, false);
-begin
-  if v_user_id is null then
-    raise exception 'Not authenticated' using errcode = '28000';
-  end if;
-  if coalesce(trim(p_legal_name), '') = '' then
-    raise exception 'Legal name is required' using errcode = '22023';
-  end if;
-  if coalesce(trim(p_display_name), '') = '' then
-    raise exception 'Display name is required' using errcode = '22023';
-  end if;
-
-  insert into public.businesses (
-    legal_name, display_name, business_type, gstin, city, state_code, phone, email,
-    is_gst_registered, gst_scheme, gst_scheme_needs_review,
-    invoice_prefix, default_credit_period_days
-  )
-  values (
-    trim(p_legal_name), trim(p_display_name), p_business_type, p_gstin, p_city, p_state_code,
-    p_phone, p_email,
-    v_is_registered,
-    case when v_is_registered then 'regular'::public.gst_scheme
-         else 'unregistered'::public.gst_scheme end,
-    false,
-    coalesce(p_invoice_prefix, 'INV'),
-    coalesce(p_default_credit_period_days, 30)
-  )
-  returning id into v_business_id;
-
-  insert into public.business_members (business_id, user_id, role, invitation_status)
-  values (v_business_id, v_user_id, 'owner', 'accepted');
-
-  perform public.write_audit_log(
-    v_business_id, 'business', v_business_id, 'business.created', null,
-    jsonb_build_object(
-      'legal_name', p_legal_name,
-      'display_name', p_display_name,
-      'gst_scheme', case when v_is_registered then 'regular' else 'unregistered' end
-    )
+  select public.create_business_with_owner(
+    p_legal_name, p_display_name, p_business_type, p_gstin, p_city, p_state_code,
+    p_phone, p_email, p_is_gst_registered, p_invoice_prefix,
+    p_default_credit_period_days, null
   );
-
-  return v_business_id;
-end;
 $$;
+
+revoke all on function public.create_business_with_owner(text, text, text, text, text, text, text, text, boolean, text, smallint) from public;
+grant execute on function public.create_business_with_owner(text, text, text, text, text, text, text, text, boolean, text, smallint) to authenticated;
 
 revoke all on function public.create_business_with_owner(text, text, text, text, text, text, text, text, boolean, text, smallint) from public;
 grant execute on function public.create_business_with_owner(text, text, text, text, text, text, text, text, boolean, text, smallint) to authenticated;

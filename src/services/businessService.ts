@@ -20,6 +20,12 @@ export interface CreateBusinessInput {
   phone?: string | null;
   email?: string | null;
   isGstRegistered?: boolean;
+  /**
+   * Explicit GST scheme. When supplied the server derives `is_gst_registered`
+   * from it. When omitted the server falls back to `isGstRegistered` and flags
+   * a registered business for review rather than assuming the regular scheme.
+   */
+  gstScheme?: GstScheme | null;
   invoicePrefix?: string;
   defaultCreditPeriodDays?: number;
 }
@@ -71,6 +77,7 @@ export async function createBusiness(input: CreateBusinessInput): Promise<string
       p_is_gst_registered: input.isGstRegistered ?? false,
       p_invoice_prefix: input.invoicePrefix ?? 'INV',
       p_default_credit_period_days: input.defaultCreditPeriodDays ?? 30,
+      p_gst_scheme: input.gstScheme ?? null,
     }),
   );
   return data as string;

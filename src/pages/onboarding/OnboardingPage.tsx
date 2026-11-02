@@ -49,6 +49,12 @@ const schema = z.object({
   email: z.string().trim().optional().refine((v) => !v || /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v), {
     message: 'Enter a valid email address',
   }),
+  /**
+   * GST scheme is chosen explicitly. It is never inferred from the GSTIN,
+   * because a composition taxpayer is also GST-registered but may not issue
+   * tax invoices.
+   */
+  gstScheme: z.enum(['unregistered', 'regular', 'composition']),
   invoicePrefix: z
     .string()
     .trim()
@@ -89,12 +95,14 @@ export function OnboardingPage() {
       stateCode: '',
       phone: '',
       email: '',
+      gstScheme: 'unregistered',
       invoicePrefix: 'INV',
       defaultCreditPeriodDays: '30',
     },
   });
 
   const gstin = watch('gstin') ?? '';
+  const gstScheme = watch('gstScheme');
 
   async function onSubmit(values: FormValues) {
     setFormError(null);
@@ -108,7 +116,11 @@ export function OnboardingPage() {
         stateCode: values.stateCode || null,
         phone: values.phone || null,
         email: values.email || null,
-        isGstRegistered: Boolean(values.gstin),
+        isGstRegistered: values.gstScheme !== 'unregistered',
+        // The scheme is chosen explicitly. The server never assumes 'regular'
+        // for a registered business, because a composition taxpayer is also
+        // registered but may not issue tax invoices.
+        gstScheme: values.gstScheme,
         invoicePrefix: values.invoicePrefix.toUpperCase(),
         defaultCreditPeriodDays: Number(values.defaultCreditPeriodDays),
       });
@@ -167,13 +179,33 @@ export function OnboardingPage() {
           {...register('businessType')}
         />
 
-        <Input
-          label="GSTIN (optional)"
-          placeholder="22AAAAA0000A1Z5"
-          hint="Leave blank if you are not GST-registered."
-          error={errors.gstin?.message}
-          {...register('gstin')}
+        <Select
+          label="GST registration"
+          options={[
+            { value: 'unregistered', label: 'Not registered for GST' },
+            { value: 'regular', label: 'Regular GST registration' },
+            { value: 'composition', label: 'Composition scheme' },
+          ]}
+          hint={
+            gstScheme === 'composition'
+              ? 'Composition businesses cannot issue tax invoices or collect GST.'
+              : gstScheme === 'regular'
+                ? 'You can issue tax invoices with CGST/SGST or IGST.'
+                : 'You cannot charge GST on invoices.'
+          }
+          error={errors.gstScheme?.message}
+          {...register('gstScheme')}
         />
+
+        {gstScheme !== 'unregistered' && (
+          <Input
+            label="GSTIN"
+            placeholder="22AAAAA0000A1Z5"
+            hint="Format is validated only — this does not verify the GSTIN with the GST portal."
+            error={errors.gstin?.message}
+            {...register('gstin')}
+          />
+        )}
 
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <Input
@@ -224,9 +256,16 @@ export function OnboardingPage() {
           />
         </div>
 
-        {gstin && (
-          <p className="rounded-lg bg-navy-50 px-3 py-2 text-xs text-navy-700">
-            GST-registered businesses can issue tax invoices with CGST/SGST or IGST breakdown.
+        {gstScheme === 'composition' && (
+          <p className="rounded-lg bg-warning-50 px-3 py-2 text-xs text-warning-700">
+            Composition businesses cannot issue tax invoices or collect GST from customers.
+            Bill of Supply is not yet supported in BizPilot.
+          </p>
+        )}
+
+        {gstScheme === 'regular' && !gstin && (
+          <p className="rounded-lg bg-warning-50 px-3 py-2 text-xs text-warning-700">
+            Add your GSTIN so it appears on the tax invoices you issue.
           </p>
         )}
 
