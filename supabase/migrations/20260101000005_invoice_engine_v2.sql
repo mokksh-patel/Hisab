@@ -3,6 +3,14 @@
 --
 -- ADDITIVE ONLY. Nothing here changes the meaning of existing data.
 --
+-- TRANSACTIONALITY
+--   The Supabase CLI runs each migration file inside a single transaction, but
+--   this file also wraps itself in an explicit BEGIN/COMMIT so that a failure
+--   at ANY statement rolls back every earlier statement. A previous attempt
+--   failed at the invoice_items backfill and left enums and columns behind
+--   because the file relied on the CLI's implicit transaction. The explicit
+--   block removes that dependency.
+--
 -- WHAT THIS MIGRATION ADDS
 --   1. businesses.gst_scheme        — unregistered | regular | composition
 --   2. invoices.price_includes_tax  — whether line prices were tax-inclusive
@@ -12,6 +20,7 @@
 --   5. invoice_items.discount_value — the raw discount input (bp or paise)
 --   6. create_invoice() v2          — inclusive pricing, fixed discounts,
 --                                     invoice-level discount, GST scheme checks
+--   7. confirm_gst_scheme()         — owner-only scheme confirmation
 --
 -- BACKWARDS COMPATIBILITY
 --   * Every new column is nullable or has a default that reproduces the old
@@ -32,6 +41,8 @@
 --   migration is forward-only by default; run it manually if a rollback is
 --   required before any data depends on the new columns.
 -- ===========================================================================
+
+begin;
 
 -- ---------------------------------------------------------------------------
 -- 1. GST scheme on businesses
@@ -131,13 +142,84 @@ alter table public.invoice_items
   add column if not exists discount_value numeric(20,0) not null default 0;
 
 -- Backfill: existing items used percentage discounts only.
-update public.invoice_items
-set discount_type = case
-      when discount_percent_basis_points > 0 then 'percent'::public.discount_type
-      else 'none'::public.discount_type
-    end,
-    discount_value = discount_percent_basis_points
-where discount_type = 'none' and discount_value = 0;
+--
+-- WHY THIS NEEDS A TRIGGER BYPASS
+-- `invoice_items_guard_change` rejects ANY update to a line item whose parent
+-- invoice is not a draft. Every historical line item belongs to an issued
+-- invoice, so a plain UPDATE fails with:
+--     'Line items of an issued invoice cannot be changed' (SQLSTATE 22023)
+--
+-- The bypass is deliberately narrow:
+--   * It disables ONLY `invoice_items_guard_change`.
+--   * It runs inside a DO block, which is a single transaction — if anything
+--     raises, the whole block rolls back and the trigger is restored.
+--   * The trigger is re-enabled in the same block, before it can commit.
+--   * It touches ONLY the two new metadata columns. No financial column
+--     (quantity, price, taxable, tax, line_total) is modified.
+--   * It only runs when there is actually something to backfill, so a fresh
+--     database never disables the trigger at all.
+--
+-- The alternative — a legacy-field fallback that never writes to issued rows —
+-- was rejected because `discount_type`/`discount_value` would then be wrong for
+-- historical rows, and every future read would need a COALESCE fallback. That
+-- spreads the compatibility burden across the whole application instead of
+-- confining it to one migration statement.
+do $$
+declare
+  v_pending integer;
+begin
+  select count(*) into v_pending
+  from public.invoice_items
+  where discount_type = 'none' and discount_value = 0;
+
+  if v_pending = 0 then
+    raise notice 'invoice_items backfill: nothing to do';
+    return;
+  end if;
+
+  -- Narrow, transactional bypass of the immutability guard.
+  alter table public.invoice_items disable trigger invoice_items_guard_change;
+
+  begin
+    update public.invoice_items
+    set discount_type = case
+          when discount_percent_basis_points > 0 then 'percent'::public.discount_type
+          else 'none'::public.discount_type
+        end,
+        discount_value = discount_percent_basis_points
+    where discount_type = 'none' and discount_value = 0;
+
+    raise notice 'invoice_items backfill: % row(s) updated', v_pending;
+  exception
+    when others then
+      -- Restore the guard before propagating, so a failure never leaves the
+      -- table unprotected.
+      alter table public.invoice_items enable trigger invoice_items_guard_change;
+      raise;
+  end;
+
+  -- Always restore the guard. This runs before the block commits.
+  alter table public.invoice_items enable trigger invoice_items_guard_change;
+end;
+$$;
+
+-- Prove the guard is active again. If this fails, the migration aborts.
+do $$
+declare
+  v_enabled "char";
+begin
+  select tgenabled into v_enabled
+  from pg_trigger
+  where tgname = 'invoice_items_guard_change'
+    and tgrelid = 'public.invoice_items'::regclass;
+
+  if v_enabled is null or v_enabled = 'D' then
+    raise exception
+      'invoice_items_guard_change is not enabled after the backfill — aborting migration'
+      using errcode = '22023';
+  end if;
+end;
+$$;
 
 comment on column public.invoice_items.discount_type is
   'How the discount was entered. percent -> discount_value is basis points; fixed -> discount_value is paise.';
@@ -579,7 +661,7 @@ returns void
 language plpgsql
 security definer
 set search_path = public, pg_temp
-as $
+as $$
 declare
   v_previous public.gst_scheme;
   v_previous_review boolean;
@@ -620,7 +702,7 @@ begin
     )
   );
 end;
-$;
+$$;
 
 revoke all on function public.confirm_gst_scheme(uuid, public.gst_scheme) from public;
 grant execute on function public.confirm_gst_scheme(uuid, public.gst_scheme) to authenticated;
@@ -689,19 +771,26 @@ begin
 end;
 $$;
 
+commit;
+
 -- ===========================================================================
 -- DOWN (manual rollback — run only if this migration must be reverted before
 -- any invoice depends on the new columns)
 --
+--   begin;
+--   drop function if exists public.confirm_gst_scheme(uuid, public.gst_scheme);
 --   drop function if exists public.create_invoice(uuid, uuid, date, date, text, text, jsonb, text, text, boolean, numeric);
 --   -- restore the 0003 definition of create_invoice() and guard_invoice_update()
 --   alter table public.invoice_items drop column if exists discount_value;
 --   alter table public.invoice_items drop column if exists discount_type;
 --   alter table public.invoices drop column if exists invoice_discount_paise;
 --   alter table public.invoices drop column if exists price_includes_tax;
---   alter table public.businesses drop constraint if exists businesses_composition_not_registered;
+--   alter table public.businesses drop constraint if exists businesses_gst_scheme_registration_consistent;
 --   alter table public.businesses drop column if exists gst_scheme_needs_review;
 --   alter table public.businesses drop column if exists gst_scheme;
 --   drop type if exists public.discount_type;
 --   drop type if exists public.gst_scheme;
+--   commit;
 -- ===========================================================================
+
+-- end of migration 0005

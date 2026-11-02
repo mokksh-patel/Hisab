@@ -10,6 +10,7 @@ const files = [
   'supabase/tests/01_security_test.sql',
   'supabase/tests/02_view_isolation_test.sql',
   'supabase/tests/03_invoice_engine_v2_test.sql',
+  'supabase/migrations/20260101000005_invoice_engine_v2.sql',
 ];
 
 for (const file of files) {
