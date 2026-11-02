@@ -98,10 +98,25 @@ begin
 end;
 $$;
 
-insert into public.businesses (id, legal_name, display_name, state_code, invoice_prefix)
+-- GST scheme is set explicitly rather than left to the migration default.
+-- Migration 0005 defaults gst_scheme to 'unregistered', and create_invoice()
+-- rejects any non-exempt invoice for an unregistered business with 22023. The
+-- financial tests below create an 18% GST invoice for Alpha, so Alpha must be
+-- a confirmed 'regular' taxpayer. gst_scheme_needs_review is cleared because
+-- these fixtures represent businesses whose scheme is already confirmed.
+--
+-- The values satisfy businesses_gst_scheme_registration_consistent:
+--   regular      -> is_gst_registered = true
+--   unregistered -> is_gst_registered = false
+insert into public.businesses (
+  id, legal_name, display_name, state_code, invoice_prefix,
+  is_gst_registered, gst_scheme, gst_scheme_needs_review
+)
 values
-  ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Alpha Traders Pvt Ltd', 'Alpha Traders', '24', 'ALP'),
-  ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'Beta Industries LLP', 'Beta Industries', '27', 'BET');
+  ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Alpha Traders Pvt Ltd', 'Alpha Traders', '24', 'ALP',
+   true, 'regular', false),
+  ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'Beta Industries LLP', 'Beta Industries', '27', 'BET',
+   false, 'unregistered', false);
 
 insert into public.business_members (business_id, user_id, role, invitation_status)
 values
@@ -425,6 +440,14 @@ select isnt(
 );
 
 -- Issued invoices are financially frozen.
+--
+-- This assertion targets guard_invoice_update(), so it runs as the privileged
+-- database test role. Under `authenticated` the table ACL from migration 0005
+-- rejects the UPDATE with 42501 before the trigger can fire, which would prove
+-- client authorization rather than the trigger. Client authorization is proven
+-- separately in section 7e of 03_invoice_engine_v2_test.sql.
+reset role;
+
 select throws_ok(
   $$ update public.invoices set total_amount_paise = 1
      where invoice_number = 'ALP-TEST-001' $$,
@@ -432,6 +455,10 @@ select throws_ok(
   null,
   'An issued invoice total cannot be edited'
 );
+
+-- Restore the Alpha owner client context for the record_payment() RPC tests.
+set local role authenticated;
+set local request.jwt.claims = '{"sub":"11111111-1111-1111-1111-111111111111","role":"authenticated"}';
 
 -- Record a partial payment of ₹500 allocated to the invoice.
 select lives_ok(
@@ -506,7 +533,13 @@ select is(
 
 -- ===========================================================================
 -- 5b. Invoice immutability — an issued invoice cannot be reverted to draft
+--
+--   These assertions target guard_invoice_update() and invoice_items_guard_change,
+--   so they run as the privileged database test role. Under `authenticated` the
+--   table ACL rejects the UPDATE with 42501 before either trigger fires.
 -- ===========================================================================
+reset role;
+
 select throws_ok(
   $$ update public.invoices set document_state = 'draft'
      where invoice_number = 'ALP-TEST-001' $$,
@@ -529,6 +562,10 @@ select throws_ok(
   null,
   'Line items of an issued invoice cannot be edited'
 );
+
+-- Restore the Alpha owner client context for the payment reversal RPC tests.
+set local role authenticated;
+set local request.jwt.claims = '{"sub":"11111111-1111-1111-1111-111111111111","role":"authenticated"}';
 
 -- ===========================================================================
 -- 5c. Payment reversal
@@ -603,6 +640,11 @@ select throws_ok(
   'An invoice cannot be voided twice'
 );
 
+-- This assertion targets guard_invoice_update(), so it runs as the privileged
+-- database test role. Under `authenticated` the table ACL rejects the UPDATE
+-- with 42501 before the trigger can fire.
+reset role;
+
 select throws_ok(
   $$ update public.invoices set document_state = 'issued'
      where invoice_number = 'ALP-TEST-001' $$,
@@ -610,6 +652,10 @@ select throws_ok(
   null,
   'A void invoice cannot be reinstated'
 );
+
+-- Restore the Alpha owner client context for the section 6 audit-trail tests.
+set local role authenticated;
+set local request.jwt.claims = '{"sub":"11111111-1111-1111-1111-111111111111","role":"authenticated"}';
 
 -- ===========================================================================
 -- 6. Audit trail
