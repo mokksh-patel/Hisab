@@ -1,0 +1,170 @@
+# ===========================================================================
+# BizPilot — CI (verification only, NOT a deployment pipeline)
+#
+# Runs on a GitHub-hosted Ubuntu runner and proves three things:
+#   1. the TypeScript app compiles, builds and passes its unit suite;
+#   2. every migration in supabase/migrations applies in order to a FRESH
+#      local Postgres;
+#   3. all pgTAP suites in supabase/tests pass against that database.
+#
+# SAFETY MODEL
+#   * No secrets, no `secrets.*` references, no Supabase access token.
+#   * No remote/hosted project: every Supabase command is local-only.
+#   * No `db push`, no `db reset`, no `migration repair`, no `link`.
+#     `supabase start` is what applies the migrations, to a throwaway
+#     container that is destroyed with the runner.
+#   * Failures are reported, never suppressed: no `|| true`, no
+#     `continue-on-error`, no `--ignore-health-check`.
+# ===========================================================================
+
+name: BizPilot CI
+
+on:
+  push:
+    branches:
+      - feature/b2b-architecture
+  pull_request:
+    branches:
+      - main
+
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes an in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # package.json declares engines.node >= 20.19. Node 22 is the current LTS
+  # and satisfies it; `npm run test:unit` relies on --experimental-strip-types.
+  NODE_VERSION: '22'
+  # Pinned so a CLI release cannot silently change local-stack behaviour.
+  # 2.x is required: supabase/config.toml still uses the [inbucket] section,
+  # which CLI 3.x rejects outright.
+  SUPABASE_CLI_VERSION: '2.122.1'
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Application: install, unit tests, type-check, production build.
+  # -------------------------------------------------------------------------
+  app:
+    name: App (install, unit tests, type-check, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      - name: Type-check
+        run: npx tsc -b
+
+      - name: Build
+        run: npm run build
+
+  # -------------------------------------------------------------------------
+  # Database: fresh local Supabase stack, migrations, pgTAP suites.
+  # -------------------------------------------------------------------------
+  database:
+    name: Database (migrations + pgTAP)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: ${{ env.SUPABASE_CLI_VERSION }}
+
+      - name: Show tool versions
+        run: |
+          supabase --version
+          docker --version
+
+      # `supabase start` boots the local stack and applies every file in
+      # supabase/migrations in filename order. Only Postgres is needed for
+      # pgTAP, so the other containers are excluded to keep the job fast.
+      # The stack is fresh on every run: nothing is reused between jobs.
+      - name: Start local Supabase (applies all migrations)
+        run: |
+          supabase start --exclude gotrue,realtime,storage-api,imgproxy,kong,mailpit,postgrest,postgres-meta,studio,edge-runtime,logflare,vector,supavisor
+
+      - name: Verify every migration was applied in order
+        run: |
+          set -euo pipefail
+
+          # Expected: the migration files on disk, sorted by version.
+          expected="$(ls supabase/migrations/*.sql | xargs -n1 basename | sed 's/_.*//' | sort)"
+          echo "Migration files on disk:"
+          echo "$expected"
+
+          # Actual: versions recorded in the local migration history table.
+          applied="$(supabase migration list --local | awk -F'|' 'NF>=2 {gsub(/ /,"",$1); if ($1 ~ /^[0-9]+$/) print $1}' | sort)"
+          echo "Versions recorded as applied:"
+          echo "$applied"
+
+          if [ -z "$applied" ]; then
+            echo "::error::No migrations are recorded as applied in the local database."
+            exit 1
+          fi
+
+          if [ "$expected" != "$applied" ]; then
+            echo "::error::Applied migrations do not match the files on disk."
+            diff <(echo "$expected") <(echo "$applied") || true
+            exit 1
+          fi
+
+          echo "All $(echo "$expected" | wc -l) migrations applied in order."
+
+      - name: Verify pgTAP test files are discovered
+        run: |
+          set -euo pipefail
+
+          # `supabase test db` runs every .sql file under supabase/tests.
+          # Fail loudly if a suite is missing or the directory is empty,
+          # so a silently-skipped suite can never look like a pass.
+          mapfile -t suites < <(find supabase/tests -maxdepth 1 -name '*.sql' | sort)
+          if [ "${#suites[@]}" -eq 0 ]; then
+            echo "::error::No pgTAP test files found in supabase/tests."
+            exit 1
+          fi
+
+          echo "Discovered ${#suites[@]} pgTAP suite(s):"
+          printf '  %s\n' "${suites[@]}"
+
+          for expected in \
+            01_security_test.sql \
+            02_view_isolation_test.sql \
+            03_invoice_engine_v2_test.sql
+          do
+            if [ ! -f "supabase/tests/$expected" ]; then
+              echo "::error::Expected pgTAP suite supabase/tests/$expected is missing."
+              exit 1
+            fi
+          done
+
+      # Local-only by default. `--local` is passed explicitly so the command
+      # can never fall through to a linked/hosted project.
+      - name: Run pgTAP database tests
+        run: supabase test db --local
+
+      - name: Stop local Supabase
+        if: always()
+        run: supabase stop --no-backup || true

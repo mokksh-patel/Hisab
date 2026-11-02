@@ -6,6 +6,7 @@ import { useBusiness } from '@/context/BusinessContext';
 import {
   getInvoice,
   getInvoiceBalance,
+  getInvoiceItemDiscounts,
   getInvoiceItems,
   issueInvoice,
   voidInvoice,
@@ -13,7 +14,7 @@ import {
 import { supabase } from '@/lib/supabase';
 import { toAppError, unwrap } from '@/lib/errors';
 import { formatDate, describeDueDate, daysPastDue, todayInTimeZone } from '@/lib/dateUtils';
-import { parsePaise } from '@/lib/money';
+import { parsePaise, formatPaise, basisPointsToPercent } from '@/lib/money';
 import { deriveInvoiceStatus } from '@/lib/receivablesAging';
 import { buildReminderLink, DEFAULT_REMINDER_TEMPLATE } from '@/lib/whatsapp';
 import { PageHeader } from '@/components/layout/PageHeader';
@@ -53,6 +54,31 @@ export default function InvoiceDetailPage() {
     queryFn: () => getInvoiceItems(invoiceId!),
     enabled: Boolean(invoiceId),
   });
+
+  /**
+   * Effective discount metadata per line.
+   *
+   * Issued invoice lines are immutable, so their discount_type/discount_value
+   * were never backfilled. The invoice_item_discounts view derives the
+   * effective values from discount_percent_basis_points for those rows, so this
+   * is the correct source for displaying a historical discount.
+   */
+  const discountsQuery = useQuery({
+    queryKey: ['invoice-item-discounts', invoiceId],
+    queryFn: () => getInvoiceItemDiscounts(invoiceId!),
+    enabled: Boolean(invoiceId),
+  });
+
+  const discountByItemId = useMemo(() => {
+    const map = new Map<string, { type: string; value: bigint }>();
+    for (const row of discountsQuery.data ?? []) {
+      map.set(row.invoice_item_id, {
+        type: row.effective_discount_type,
+        value: parsePaise(row.effective_discount_value),
+      });
+    }
+    return map;
+  }, [discountsQuery.data]);
 
   const allocationsQuery = useQuery({
     queryKey: ['invoice-allocations', invoiceId],
@@ -321,12 +347,20 @@ export default function InvoiceDetailPage() {
                         parsePaise(item.sgst_paise) +
                         parsePaise(item.igst_paise) +
                         parsePaise(item.cess_paise);
+                      const discount = discountByItemId.get(item.id);
                       return (
                         <tr key={item.id}>
                           <td className="px-4 py-3 sm:px-5">
                             <span className="text-ink">{item.description}</span>
                             {item.hsn_sac && (
                               <span className="ml-2 text-xs text-muted">HSN {item.hsn_sac}</span>
+                            )}
+                            {discount && discount.type !== 'none' && (
+                              <span className="ml-2 text-xs text-success-700">
+                                {discount.type === 'percent'
+                                  ? `${basisPointsToPercent(discount.value)}% off`
+                                  : `${formatPaise(discount.value)} off`}
+                              </span>
                             )}
                           </td>
                           <td className="px-4 py-3 text-right tabular text-muted">

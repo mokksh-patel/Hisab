@@ -278,32 +278,45 @@ export function calculateLine(
       cessPaise = multiplyPaise(totalTaxPaise, cessBp, totalRateBp);
       igstPaise = totalTaxPaise - cessPaise;
     } else {
-      // intra_state: split the GST portion into CGST/SGST, keep cess separate.
+      // intra_state: split the derived tax into a GST portion and a cess
+      // portion by their rate shares, then split the GST portion into CGST/SGST.
       const gstPortion = multiplyPaise(totalTaxPaise, taxRateBasisPoints, totalRateBp);
       cessPaise = totalTaxPaise - gstPortion;
 
-      const halfBp = taxRateBasisPoints / 2n;
-      const remainderBp = taxRateBasisPoints - halfBp;
-      cgstPaise = multiplyPaise(gstPortion, halfBp, taxRateBasisPoints);
-      sgstPaise = gstPortion - cgstPaise;
-      // `remainderBp` is intentionally unused: SGST is derived by subtraction so
-      // CGST + SGST always equals the GST portion exactly.
-      void remainderBp;
+      if (taxRateBasisPoints === 0n) {
+        // Cess-only line: there is no GST to split, so CGST/SGST stay zero.
+        // Guarding here avoids a division by zero in the split below.
+        cgstPaise = 0n;
+        sgstPaise = 0n;
+      } else {
+        const halfBp = taxRateBasisPoints / 2n;
+        cgstPaise = multiplyPaise(gstPortion, halfBp, taxRateBasisPoints);
+        sgstPaise = gstPortion - cgstPaise;
+      }
     }
   } else {
     taxableAmountPaise = netPaise;
 
-    if (gstMode === 'inter_state') {
-      igstPaise = multiplyPaise(taxableAmountPaise, taxRateBasisPoints, 10_000n);
-    } else if (gstMode === 'intra_state') {
-      // Split the rate in half first so CGST + SGST always equals the full rate.
-      const halfBp = taxRateBasisPoints / 2n;
-      const remainderBp = taxRateBasisPoints - halfBp;
-      cgstPaise = multiplyPaise(taxableAmountPaise, halfBp, 10_000n);
-      sgstPaise = multiplyPaise(taxableAmountPaise, remainderBp, 10_000n);
-    }
+    if (gstMode === 'exempt') {
+      // Exempt supply: no tax of any kind, including cess. The whole net is
+      // taxable value. This must match the SQL in public.create_invoice().
+      cgstPaise = 0n;
+      sgstPaise = 0n;
+      igstPaise = 0n;
+      cessPaise = 0n;
+    } else {
+      if (gstMode === 'inter_state') {
+        igstPaise = multiplyPaise(taxableAmountPaise, taxRateBasisPoints, 10_000n);
+      } else if (gstMode === 'intra_state') {
+        // Split the rate in half first so CGST + SGST always equals the full rate.
+        const halfBp = taxRateBasisPoints / 2n;
+        const remainderBp = taxRateBasisPoints - halfBp;
+        cgstPaise = multiplyPaise(taxableAmountPaise, halfBp, 10_000n);
+        sgstPaise = multiplyPaise(taxableAmountPaise, remainderBp, 10_000n);
+      }
 
-    cessPaise = multiplyPaise(taxableAmountPaise, cessBp, 10_000n);
+      cessPaise = multiplyPaise(taxableAmountPaise, cessBp, 10_000n);
+    }
   }
 
   const lineTotalPaise =
@@ -332,41 +345,108 @@ export function calculateLine(
 }
 
 /**
- * Allocate an invoice-level discount across lines in proportion to their
- * taxable value, distributing any rounding remainder to the largest line so the
- * allocation always sums exactly to the requested discount.
+ * Allocate an invoice-level discount across lines.
  *
- * Returns one allocation per line, in the same order as `lines`.
+ * SEMANTICS (must match the invoice-discount block in public.create_invoice()):
+ *
+ *   EXCLUSIVE pricing: the discount reduces the pre-discount TAXABLE amount.
+ *     base per line = taxableAmountPaise
+ *
+ *   INCLUSIVE pricing: the discount reduces the pre-discount CUSTOMER-FACING
+ *     amount, which already contains tax. Validating it against the taxable
+ *     total would wrongly reject a discount that is smaller than the invoice
+ *     total but larger than its taxable component.
+ *     base per line = grossAmountPaise - discountPaise  (the inclusive net)
+ *
+ * Allocation is proportional to the chosen base. The rounding remainder goes to
+ * the line with the largest base (ties broken by lowest index), so the
+ * allocation is deterministic and always sums exactly to the requested
+ * discount. No line's discount can exceed its own base.
  */
 export function allocateInvoiceDiscount(
   lines: readonly InvoiceLineTotals[],
   invoiceDiscountPaise: Paise,
+  priceIncludesTax = false,
 ): Paise[] {
   if (invoiceDiscountPaise <= 0n || lines.length === 0) {
     return lines.map(() => 0n);
   }
 
-  const base = sumPaise(lines.map((line) => line.taxableAmountPaise));
+  const baseFor = (line: InvoiceLineTotals): Paise =>
+    priceIncludesTax ? line.grossAmountPaise - line.discountPaise : line.taxableAmountPaise;
+
+  const bases = lines.map(baseFor);
+  const base = sumPaise(bases);
+
   if (base <= 0n) {
     throw new InvoiceCalculationError('Cannot apply an invoice discount to a zero-value invoice');
   }
   if (invoiceDiscountPaise > base) {
-    throw new InvoiceCalculationError('Invoice discount cannot exceed the taxable value');
+    throw new InvoiceCalculationError(
+      priceIncludesTax
+        ? 'Invoice discount cannot exceed the invoice total'
+        : 'Invoice discount cannot exceed the taxable value',
+    );
   }
 
-  const allocations = lines.map((line) =>
-    multiplyPaise(invoiceDiscountPaise, line.taxableAmountPaise, base),
-  );
+  // -------------------------------------------------------------------------
+  // Largest-remainder (Hamilton) allocation.
+  //
+  // Independent rounding of each share does not sum to the requested discount,
+  // and patching the difference onto one line can push that line past its own
+  // base. Largest-remainder avoids both problems:
+  //
+  //   1. exact_i   = discount * base_i / total_base        (rational)
+  //   2. floor_i   = floor(exact_i)                        (integer paise)
+  //   3. remainder = discount - sum(floor_i)               (0 <= remainder < n)
+  //   4. give 1 paise to the `remainder` lines with the largest fractional
+  //      part, ties broken by lowest line index (line_number order).
+  //
+  // Properties:
+  //   * sum(allocations) === discount, exactly.
+  //   * floor_i <= exact_i, so no line is over-allocated by rounding.
+  //   * floor_i <= base_i because discount <= total_base.
+  //   * Every allocation is >= 0.
+  // -------------------------------------------------------------------------
 
-  // Distribute the rounding remainder to the line with the largest taxable value.
-  const allocated = sumPaise(allocations);
-  const remainder = invoiceDiscountPaise - allocated;
-  if (remainder !== 0n) {
-    let largestIndex = 0;
-    for (let i = 1; i < lines.length; i += 1) {
-      if (lines[i]!.taxableAmountPaise > lines[largestIndex]!.taxableAmountPaise) largestIndex = i;
+  const floors: Paise[] = [];
+  const fractions: { index: number; frac: bigint }[] = [];
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const numerator = invoiceDiscountPaise * bases[i]!;
+    const floor = numerator / base;
+    const frac = numerator % base;
+    floors.push(floor);
+    fractions.push({ index: i, frac });
+  }
+
+  let allocated = sumPaise(floors);
+  let remainder = invoiceDiscountPaise - allocated;
+
+  // Sort by fractional part descending, then by index ascending (deterministic).
+  fractions.sort((a, b) => {
+    if (a.frac !== b.frac) return a.frac > b.frac ? -1 : 1;
+    return a.index - b.index;
+  });
+
+  const allocations = [...floors];
+  let cursor = 0;
+  while (remainder > 0n && cursor < fractions.length) {
+    const target = fractions[cursor]!.index;
+    // Never push a line past its own base.
+    if (allocations[target]! < bases[target]!) {
+      allocations[target] = allocations[target]! + 1n;
+      remainder -= 1n;
     }
-    allocations[largestIndex] = allocations[largestIndex]! + remainder;
+    cursor += 1;
+    // If every line is already at its base, the loop ends naturally.
+  }
+
+  // Defensive: if a pathological input left a remainder, it cannot be placed
+  // without exceeding a base, which would mean discount > total_base. That is
+  // already rejected above, so this is unreachable.
+  if (remainder !== 0n) {
+    throw new InvoiceCalculationError('Invoice discount could not be fully allocated');
   }
 
   return allocations;
@@ -403,36 +483,78 @@ export function calculateInvoiceTotals(
   let appliedInvoiceDiscount = 0n;
 
   if (invoiceDiscountPaise > 0n) {
-    const allocations = allocateInvoiceDiscount(computed, invoiceDiscountPaise);
+    const allocations = allocateInvoiceDiscount(computed, invoiceDiscountPaise, priceIncludesTax);
     appliedInvoiceDiscount = sumPaise(allocations);
 
     // PARITY NOTE: this must match the invoice-discount block in
     // public.create_invoice() (migration 0005). Every line is recomputed, even
     // when its allocation is zero, because the database does the same — a
     // skipped line would keep its pre-discount tax and drift from the server.
+    //
+    // INCLUSIVE PRICING: the discount reduces the tax-INCLUSIVE amount, so the
+    // taxable value must be back-solved from (gross - reduction), exactly as
+    // calculateLine() does. Subtracting the reduction from the taxable value
+    // directly would under-tax the line.
+    //
+    // EXCLUSIVE PRICING: the discount reduces the taxable value directly.
     finalLines = computed.map((line, index) => {
       const reduction = allocations[index]!;
-      const newTaxable = line.taxableAmountPaise - reduction;
       const totalRateBp = line.taxRateBasisPoints;
 
+      let newTaxable: bigint;
       let cgst = 0n;
       let sgst = 0n;
       let igst = 0n;
+      let cess = 0n;
 
-      if (gstMode === 'inter_state') {
-        igst = multiplyPaise(newTaxable, totalRateBp, 10_000n);
-      } else if (gstMode === 'intra_state') {
-        const halfBp = totalRateBp / 2n;
-        const remainderBp = totalRateBp - halfBp;
-        cgst = multiplyPaise(newTaxable, halfBp, 10_000n);
-        sgst = multiplyPaise(newTaxable, remainderBp, 10_000n);
+      if (priceIncludesTax) {
+        const newNet = line.grossAmountPaise - line.discountPaise - reduction;
+        const cessBp =
+          line.taxableAmountPaise > 0n
+            ? (line.cessPaise * 10_000n) / line.taxableAmountPaise
+            : 0n;
+        const totalBp = totalRateBp + cessBp;
+
+        if (totalBp === 0n || gstMode === 'exempt') {
+          newTaxable = newNet;
+        } else {
+          newTaxable = multiplyPaise(newNet, 10_000n, 10_000n + totalBp);
+          const totalTax = newNet - newTaxable;
+
+          if (gstMode === 'inter_state') {
+            cess = multiplyPaise(totalTax, cessBp, totalBp);
+            igst = totalTax - cess;
+          } else {
+            const gstPortion = multiplyPaise(totalTax, totalRateBp, totalBp);
+            cess = totalTax - gstPortion;
+            if (totalRateBp === 0n) {
+              cgst = 0n;
+              sgst = 0n;
+            } else {
+              const halfBp = totalRateBp / 2n;
+              cgst = multiplyPaise(gstPortion, halfBp, totalRateBp);
+              sgst = gstPortion - cgst;
+            }
+          }
+        }
+      } else {
+        newTaxable = line.taxableAmountPaise - reduction;
+
+        if (gstMode === 'inter_state') {
+          igst = multiplyPaise(newTaxable, totalRateBp, 10_000n);
+        } else if (gstMode === 'intra_state') {
+          const halfBp = totalRateBp / 2n;
+          const remainderBp = totalRateBp - halfBp;
+          cgst = multiplyPaise(newTaxable, halfBp, 10_000n);
+          sgst = multiplyPaise(newTaxable, remainderBp, 10_000n);
+        }
+
+        // Cess is recomputed on the reduced base using the original ratio.
+        cess =
+          line.taxableAmountPaise > 0n
+            ? multiplyPaise(line.cessPaise, newTaxable, line.taxableAmountPaise)
+            : 0n;
       }
-
-      // Cess is recomputed on the reduced base using the original ratio.
-      const cess =
-        line.taxableAmountPaise > 0n
-          ? multiplyPaise(line.cessPaise, newTaxable, line.taxableAmountPaise)
-          : 0n;
 
       return {
         ...line,

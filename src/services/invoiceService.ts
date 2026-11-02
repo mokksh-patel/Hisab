@@ -13,6 +13,7 @@ import type {
   Invoice,
   InvoiceBalance,
   InvoiceItem,
+  InvoiceItemDiscount,
 } from '@/types/database';
 
 export interface CreateInvoiceInput {
@@ -87,6 +88,26 @@ export async function getInvoiceItems(invoiceId: string): Promise<InvoiceItem[]>
       .eq('invoice_id', invoiceId)
       .order('line_number', { ascending: true }),
   ) as InvoiceItem[];
+}
+
+/**
+ * Effective discount metadata for an invoice's lines.
+ *
+ * Issued invoice lines are immutable, so their `discount_type`/`discount_value`
+ * columns were never backfilled. The `invoice_item_discounts` view derives the
+ * effective values from `discount_percent_basis_points` for those rows, so this
+ * is the correct source for displaying a historical discount.
+ *
+ * The view is `security_invoker = true`, so RLS applies exactly as it does to
+ * `invoice_items` itself.
+ */
+export async function getInvoiceItemDiscounts(invoiceId: string): Promise<InvoiceItemDiscount[]> {
+  return unwrap(
+    await supabase
+      .from('invoice_item_discounts')
+      .select('*')
+      .eq('invoice_id', invoiceId),
+  ) as InvoiceItemDiscount[];
 }
 
 export async function getInvoiceBalance(invoiceId: string): Promise<InvoiceBalance> {

@@ -138,6 +138,8 @@ export interface InvoiceItem {
   discount_paise: string;
   taxable_amount_paise: string;
   tax_rate_basis_points: number;
+  /** Compensation cess rate in basis points, as entered. */
+  cess_rate_basis_points: number;
   cgst_paise: string;
   sgst_paise: string;
   igst_paise: string;
@@ -174,6 +176,23 @@ export interface PaymentAllocation {
   allocated_amount_paise: string;
   created_by: string | null;
   created_at: string;
+}
+
+/**
+ * Row from the `invoice_item_discounts` view.
+ *
+ * `effective_*` fields are the values to display: for draft lines they come
+ * from the stored columns, for issued (immutable) lines they are derived from
+ * `discount_percent_basis_points`.
+ */
+export interface InvoiceItemDiscount {
+  invoice_item_id: string;
+  business_id: string;
+  invoice_id: string;
+  discount_percent_basis_points: number;
+  discount_paise: string;
+  effective_discount_type: DiscountType;
+  effective_discount_value: string;
 }
 
 export interface ReminderLog {
