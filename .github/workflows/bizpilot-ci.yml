@@ -1,11 +1,13 @@
 # ===========================================================================
 # BizPilot — CI (verification only, NOT a deployment pipeline)
 #
-# Runs on a GitHub-hosted Ubuntu runner and proves three things:
+# Runs on a GitHub-hosted Ubuntu runner and proves four things:
 #   1. the TypeScript app compiles, builds and passes its unit suite;
 #   2. every migration in supabase/migrations applies in order to a FRESH
 #      local Postgres;
-#   3. all pgTAP suites in supabase/tests pass against that database.
+#   3. all pgTAP suites in supabase/tests pass against that database;
+#   4. the Playwright E2E suite passes against a complete local stack
+#      (Auth + PostgREST) on desktop and mobile viewports.
 #
 # SAFETY MODEL
 #   * No secrets, no `secrets.*` references, no Supabase access token.
@@ -13,6 +15,9 @@
 #   * No `db push`, no `db reset`, no `migration repair`, no `link`.
 #     `supabase start` is what applies the migrations, to a throwaway
 #     container that is destroyed with the runner.
+#   * The E2E job exports only the local API URL and the publishable (anon)
+#     key. The service-role key and JWT secret are filtered out and never
+#     written to the environment or the log.
 #   * Failures are reported, never suppressed: no `continue-on-error`, no
 #     `--ignore-health-check`, and no `|| true` on any verification check.
 #     The only tolerated non-zero status is the best-effort `supabase stop`
@@ -201,6 +206,144 @@ jobs:
       # can never fall through to a linked/hosted project.
       - name: Run pgTAP database tests
         run: supabase test db --local
+
+      # Best-effort teardown only. This runs after every check has already
+      # decided the job result, so it cannot mask a failure.
+      - name: Stop local Supabase
+        if: always()
+        run: supabase stop --no-backup || true
+
+  # -------------------------------------------------------------------------
+  # E2E: full local Supabase stack (Auth + PostgREST) + Playwright.
+  #
+  # Unlike the database job, this one starts the COMPLETE stack: the browser
+  # tests sign in through GoTrue and read through PostgREST, so excluding those
+  # containers would make every test fail.
+  #
+  # Only the public API URL and the publishable (anon) key are exported. The
+  # full `supabase status` output is never echoed because it also contains the
+  # service-role key and the JWT secret.
+  # -------------------------------------------------------------------------
+  e2e:
+    name: E2E (Playwright desktop + mobile)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set up Supabase CLI
+        uses: supabase/setup-cli@v3
+        with:
+          version: ${{ env.SUPABASE_CLI_VERSION }}
+
+      - name: Show tool versions
+        run: |
+          supabase --version
+          docker --version
+
+      # Complete stack: no --exclude. `supabase start` applies every migration
+      # in supabase/migrations in filename order to a throwaway database.
+      - name: Start local Supabase (full stack, applies all migrations)
+        run: supabase start
+
+      - name: Verify every migration was applied in order
+        run: |
+          set -euo pipefail
+
+          expected="$(ls supabase/migrations/*.sql | xargs -n1 basename | sed 's/_.*//' | sort)"
+          raw="$(supabase db query --local -o csv \
+            "select version from supabase_migrations.schema_migrations order by version")"
+          applied="$(printf '%s\n' "$raw" | tr -d '\r' | grep -E '^[0-9]{14}$' | sort)"
+
+          echo "Migration files on disk:"
+          printf '%s\n' "$expected"
+          echo
+          echo "Versions recorded as applied:"
+          printf '%s\n' "${applied:-<none>}"
+          echo
+
+          if [ -z "$applied" ]; then
+            echo "::error::No 14-digit migration versions found in supabase_migrations.schema_migrations."
+            echo "Raw query output was:"
+            printf '%s\n' "$raw"
+            exit 1
+          fi
+
+          if [ "$expected" != "$applied" ]; then
+            echo "::error::Applied migrations do not match the files on disk."
+            echo "--- on disk but NOT applied ---"
+            comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$applied")
+            echo "--- applied but NOT on disk ---"
+            comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$applied")
+            exit 1
+          fi
+
+          echo "All $(printf '%s\n' "$expected" | wc -l) migrations applied in order."
+
+      # Exports ONLY the two public values the browser needs. `supabase status
+      # -o env` also prints SERVICE_ROLE_KEY and JWT_SECRET; those are filtered
+      # out here and never written to the environment or the log.
+      - name: Export local Supabase API URL and anon key
+        run: |
+          set -euo pipefail
+
+          status_env="$(supabase status -o env)"
+
+          api_url="$(printf '%s\n' "$status_env" | sed -n 's/^API_URL="\(.*\)"$/\1/p')"
+          anon_key="$(printf '%s\n' "$status_env" | sed -n 's/^ANON_KEY="\(.*\)"$/\1/p')"
+
+          if [ -z "$api_url" ] || [ -z "$anon_key" ]; then
+            echo "::error::Could not read API_URL / ANON_KEY from 'supabase status -o env'."
+            echo "Available variable names were:"
+            printf '%s\n' "$status_env" | sed 's/=.*$/=<redacted>/'
+            exit 1
+          fi
+
+          # Fail closed if the CLI ever reports a non-loopback API URL.
+          case "$api_url" in
+            http://127.0.0.1:*|http://localhost:*|http://\[::1\]:*) ;;
+            *)
+              echo "::error::Local Supabase API URL is not a loopback address. Refusing to run E2E."
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "E2E_SUPABASE_URL=$api_url"
+            echo "E2E_SUPABASE_PUBLISHABLE_KEY=$anon_key"
+          } >> "$GITHUB_ENV"
+
+          echo "Exported E2E_SUPABASE_URL and E2E_SUPABASE_PUBLISHABLE_KEY (values not printed)."
+
+      - name: Install Playwright Chromium and system dependencies
+        run: npx playwright install --with-deps chromium
+
+      # The suite fails (not skips) when the local stack is unreachable or the
+      # synthetic accounts cannot be created.
+      - name: Run Playwright E2E (desktop + mobile)
+        run: npm run test:e2e
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+          if-no-files-found: ignore
 
       # Best-effort teardown only. This runs after every check has already
       # decided the job result, so it cannot mask a failure.

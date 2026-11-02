@@ -12,21 +12,66 @@
  * The signup *form* is still tested — see auth.spec.ts, which asserts client-side
  * validation and the server's rejection messages.
  *
+ * LOCAL ONLY:
+ * The insert runs through `supabase db query --local`, which talks to the
+ * ephemeral stack started by `supabase start`. There is no `--linked`, no
+ * `--remote` and no database URL, so this setup cannot reach a hosted project.
+ * The command is executed with an argument array (no shell), so no value can be
+ * interpreted as a flag or a redirect.
+ *
  * Accounts are created ONCE and reused. Each test gets its own business,
  * customer and invoice, so tests remain independent.
  */
 
-import { execSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
-import { E2E_PASSWORD, isSupabaseConfigured, type TestAccount } from './fixtures';
+import { execFileSync } from 'node:child_process';
+import { existsSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { E2E_PASSWORD, type TestAccount } from './fixtures';
+import { readE2EConfig } from './env';
 
 export const ACCOUNTS_FILE = resolve(process.cwd(), 'tests/e2e/.accounts.json');
+
+/**
+ * Resolves the npm CLI entry point so `npx` can be run without a shell.
+ *
+ * WHY NOT `execFileSync('npx', ...)`:
+ *   * On Windows `npx` is a `.cmd` shim, not an executable, so spawning it
+ *     directly fails with ENOENT.
+ *   * Node 20+ refuses to spawn `.cmd`/`.bat` files without `shell: true`
+ *     (CVE-2024-27980), which fails with EINVAL.
+ *   * Using `shell: true` would reintroduce shell-string interpolation, which
+ *     is exactly what this setup must avoid.
+ *
+ * Running `node <npx-cli.js> ...` sidesteps all three: it is a real executable
+ * (the current Node binary), it takes an argument array, and no shell is
+ * involved on any platform.
+ */
+function npxCliPath(): string {
+  const candidates = [
+    // Windows and the official Node installers.
+    resolve(dirname(process.execPath), 'node_modules/npm/bin/npx-cli.js'),
+    // POSIX layouts (Linux/macOS, including GitHub Actions runners).
+    resolve(dirname(process.execPath), '../lib/node_modules/npm/bin/npx-cli.js'),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error(
+    'could not locate the npm CLI (npx-cli.js). Ensure npm is installed alongside Node.',
+  );
+}
 
 export interface E2EAccounts {
   primary: TestAccount;
   secondary: TestAccount;
   resilience: TestAccount;
+  /**
+   * Dedicated to the onboarding test. It is created fresh on every run and is
+   * never used by any other test, so it is guaranteed to have zero businesses
+   * when the onboarding test signs in. This is what makes that test repeatable
+   * without a conditional skip.
+   */
+  onboarding: TestAccount;
 }
 
 function randomId(): string {
@@ -34,15 +79,15 @@ function randomId(): string {
 }
 
 async function globalSetup(): Promise<void> {
-  if (!isSupabaseConfigured()) {
-    console.warn('[e2e] Supabase not configured — tests will skip.');
-    return;
-  }
+  // Fails closed: throws if the configuration is missing or points anywhere
+  // other than loopback. Setup never silently skips.
+  readE2EConfig();
 
   const stamp = randomId();
   const primaryEmail = `e2e+primary-${stamp}@example.com`;
   const secondaryEmail = `e2e+secondary-${stamp}@example.com`;
   const resilienceEmail = `e2e+resilience-${stamp}@example.com`;
+  const onboardingEmail = `e2e+onboarding-${stamp}@example.com`;
 
   // Insert the users with a bcrypt hash of E2E_PASSWORD. `crypt(..., gen_salt('bf'))`
   // produces the same format GoTrue uses, so signInWithPassword works normally.
@@ -52,6 +97,9 @@ async function globalSetup(): Promise<void> {
   //
   // A dedicated `resilience` account exists so those tests never share business
   // state with the auth/receivables suites. Shared state made results flaky.
+  //
+  // The emails are generated locally and contain no quotes, so they are safe to
+  // inline. E2E_PASSWORD is a fixed test constant, not a secret.
   const sql = `
     insert into auth.users (
       instance_id, id, aud, role, email, encrypted_password,
@@ -75,13 +123,21 @@ async function globalSetup(): Promise<void> {
     from (values
       ('${primaryEmail}', 'E2E Primary'),
       ('${secondaryEmail}', 'E2E Secondary'),
-      ('${resilienceEmail}', 'E2E Resilience')
+      ('${resilienceEmail}', 'E2E Resilience'),
+      ('${onboardingEmail}', 'E2E Onboarding')
     ) as u(email, full_name)
     returning id, email;
   `;
 
-  const output = execSync(
-    `npx --yes supabase db query --linked --output json "${sql.replace(/"/g, '\\"').replace(/\n/g, ' ')}"`,
+  // execFileSync with an argument array: no shell, so the SQL cannot be
+  // reinterpreted as a flag or a shell redirect. `--local` is explicit and
+  // there is deliberately no `--linked` / `--remote` / `--db-url`.
+  //
+  // The command is `node <npx-cli.js> ...` rather than `npx ...` so it works
+  // identically on Windows and Linux without a shell (see npxCliPath).
+  const output = execFileSync(
+    process.execPath,
+    [npxCliPath(), '--yes', 'supabase', 'db', 'query', '--local', '--output', 'json', sql],
     { stdio: 'pipe', timeout: 180_000, encoding: 'utf8' },
   );
 
@@ -90,19 +146,27 @@ async function globalSetup(): Promise<void> {
   const primary = rows.find((row) => row.email === primaryEmail);
   const secondary = rows.find((row) => row.email === secondaryEmail);
   const resilience = rows.find((row) => row.email === resilienceEmail);
+  const onboarding = rows.find((row) => row.email === onboardingEmail);
 
-  if (!primary || !secondary || !resilience) {
-    throw new Error(`could not create e2e accounts. Output: ${output}`);
+  if (!primary || !secondary || !resilience || !onboarding) {
+    // Do not echo the raw output: it can contain password hashes.
+    throw new Error(
+      'could not create e2e accounts in the local database. ' +
+        'Check that `supabase start` is running and that migrations applied.',
+    );
   }
 
   const accounts: E2EAccounts = {
     primary: { email: primaryEmail, password: E2E_PASSWORD, userId: primary.id },
     secondary: { email: secondaryEmail, password: E2E_PASSWORD, userId: secondary.id },
     resilience: { email: resilienceEmail, password: E2E_PASSWORD, userId: resilience.id },
+    onboarding: { email: onboardingEmail, password: E2E_PASSWORD, userId: onboarding.id },
   };
 
   writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2), 'utf8');
-  console.log(`[e2e] created accounts: ${primaryEmail}, ${secondaryEmail}, ${resilienceEmail}`);
+  console.log(
+    `[e2e] created accounts: ${primaryEmail}, ${secondaryEmail}, ${resilienceEmail}, ${onboardingEmail}`,
+  );
 }
 
 function parseRows(output: string): { id: string; email: string }[] {

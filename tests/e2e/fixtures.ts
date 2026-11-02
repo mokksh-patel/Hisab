@@ -11,9 +11,7 @@
  */
 
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-
-const SUPABASE_URL = process.env.VITE_SUPABASE_URL ?? '';
-const PUBLISHABLE_KEY = process.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? '';
+import { readE2EConfig } from './env';
 
 export const E2E_PASSWORD = 'E2eTestPass123!';
 
@@ -23,13 +21,12 @@ export function syntheticEmail(label: string): string {
   return `e2e+${label}-${stamp}@example.com`;
 }
 
-export function isSupabaseConfigured(): boolean {
-  return Boolean(SUPABASE_URL && PUBLISHABLE_KEY);
-}
-
 /** A fresh, unauthenticated client for driving the API directly. */
 export function anonClient(): SupabaseClient {
-  return createClient(SUPABASE_URL, PUBLISHABLE_KEY, {
+  // readE2EConfig throws if the URL is not loopback, so this client can only
+  // ever be constructed against the local stack.
+  const { url, publishableKey } = readE2EConfig();
+  return createClient(url, publishableKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 }
@@ -73,7 +70,15 @@ export async function signInAs(account: TestAccount): Promise<SupabaseClient> {
   return client;
 }
 
-/** Creates a business for the signed-in user and returns its id. */
+/**
+ * Creates a business for the signed-in user and returns its id.
+ *
+ * GST: `p_gst_scheme: 'regular'` is passed explicitly. Migration 0005 flags a
+ * newly registered business for review when the scheme is left NULL (the
+ * backwards-compatible path), and create_invoice() refuses to charge GST until
+ * the owner confirms the scheme. These fixtures represent businesses that are
+ * already confirmed regular taxpayers, so the scheme is stated up front.
+ */
 export async function createBusiness(
   client: SupabaseClient,
   displayName: string,
@@ -84,6 +89,7 @@ export async function createBusiness(
     p_state_code: '24',
     p_invoice_prefix: 'E2E',
     p_is_gst_registered: true,
+    p_gst_scheme: 'regular',
   });
   if (error) throw new Error(`create_business failed: ${error.message}`);
   return data as string;
@@ -180,6 +186,8 @@ export interface E2EAccounts {
   primary: TestAccount;
   secondary: TestAccount;
   resilience: TestAccount;
+  /** Fresh on every run; used only by the onboarding test. */
+  onboarding: TestAccount;
 }
 
 /** Loads the accounts created by global-setup. Throws if setup did not run. */

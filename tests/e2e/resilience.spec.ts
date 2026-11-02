@@ -13,10 +13,10 @@
  */
 
 import { expect, test, type Page } from '@playwright/test';
-import { isSupabaseConfigured, loadAccounts } from './fixtures';
+import { loadAccounts } from './fixtures';
+import { authStorageKey, readE2EConfig } from './env';
 
 test.describe('Resilience', () => {
-  test.skip(!isSupabaseConfigured(), 'Supabase is not configured');
 
   test('tablet layout renders navigation and dashboard', async ({ browser }) => {
     const { resilience } = loadAccounts();
@@ -116,9 +116,11 @@ test.describe('Resilience', () => {
 
   test('an invalid session token redirects to login', async ({ page }) => {
     await page.goto('/login');
-    await page.evaluate(() => {
+    await page.evaluate((fallbackKey) => {
       const key = Object.keys(window.localStorage).find((k) => k.includes('auth-token'));
-      const storageKey = key ?? 'sb-xseytkeykqwgirgixlir-auth-token';
+      // The storage key is derived from the local Supabase URL, so no remote
+      // project reference is hard-coded here.
+      const storageKey = key ?? fallbackKey;
       window.localStorage.setItem(
         storageKey,
         JSON.stringify({
@@ -129,7 +131,7 @@ test.describe('Resilience', () => {
           user: { id: '00000000-0000-0000-0000-000000000000', email: 'expired@example.com' },
         }),
       );
-    });
+    }, authStorageKey(readE2EConfig().url));
 
     await page.goto('/');
     await expect(page).toHaveURL(/\/login/, { timeout: 25_000 });

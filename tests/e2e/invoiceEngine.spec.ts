@@ -15,13 +15,11 @@ import { expect, test } from '@playwright/test';
 import {
   createBusiness,
   createCustomer,
-  isSupabaseConfigured,
   loadAccounts,
   signInAs,
 } from './fixtures';
 
 test.describe('Invoice Engine V2', () => {
-  test.skip(!isSupabaseConfigured(), 'Supabase is not configured');
 
   test('create page exposes pricing mode and invoice discount', async ({ page }) => {
     const { resilience } = loadAccounts();

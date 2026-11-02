@@ -12,7 +12,6 @@ import {
   createBusiness,
   createCustomer,
   createInvoice,
-  isSupabaseConfigured,
   issueInvoice,
   loadAccounts,
   recordPayment,
@@ -20,25 +19,24 @@ import {
 } from './fixtures';
 
 test.describe('Receivables workflow', () => {
-  test.skip(!isSupabaseConfigured(), 'Supabase is not configured');
 
   test('onboarding creates a business and lands on the dashboard', async ({ page }) => {
-    // The secondary account is reserved for onboarding so it never has a
-    // business already. If it does (a previous run), the test is skipped rather
-    // than failing for the wrong reason.
-    const { secondary } = loadAccounts();
+    // A dedicated account is created fresh by global-setup on every run and is
+    // used by no other test, so it is guaranteed to have zero businesses here.
+    // That makes this test repeatable without a conditional skip: the account
+    // can never arrive with a business already attached.
+    const { onboarding } = loadAccounts();
 
     await page.goto('/login');
-    await page.getByLabel('Email').fill(secondary.email);
-    await page.getByLabel('Password').fill(secondary.password);
+    await page.getByLabel('Email').fill(onboarding.email);
+    await page.getByLabel('Password').fill(onboarding.password);
     await page.getByRole('button', { name: 'Sign in' }).click();
 
-    // Either we land on onboarding (fresh account) or the dashboard (already set up).
-    await expect(page).toHaveURL(/\/onboarding|\//, { timeout: 25_000 });
-
-    if (!page.url().includes('/onboarding')) {
-      test.skip(true, 'secondary account already has a business from a previous run');
-    }
+    // A user with no business is redirected to onboarding by RequireBusiness.
+    // Asserting the URL is the precondition of this test, not a branch: if the
+    // account unexpectedly has a business, the test must fail loudly rather
+    // than skip.
+    await expect(page).toHaveURL(/\/onboarding/, { timeout: 25_000 });
 
     await expect(page.getByRole('heading', { name: 'Set up your business' })).toBeVisible();
 

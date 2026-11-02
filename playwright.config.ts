@@ -1,35 +1,28 @@
 import { defineConfig, devices } from '@playwright/test';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readE2EConfig } from './tests/e2e/env';
 
 /**
- * Load .env.local into process.env so the e2e fixtures can talk to Supabase
- * directly. Vite loads this file for the app; Playwright does not, so we do it
- * here. Only VITE_* (publishable) values are read — never a service-role key.
+ * E2E configuration.
+ *
+ * LOCAL ONLY. `.env.local` is deliberately NOT loaded: it holds the developer's
+ * hosted test-project credentials, and loading it would let the browser tests
+ * write to a remote database. Instead the suite reads dedicated E2E_* variables
+ * (see tests/e2e/env.ts), which are validated to be loopback addresses.
+ *
+ * The app under test is Vite, which reads VITE_SUPABASE_URL and
+ * VITE_SUPABASE_PUBLISHABLE_KEY at build/dev-server start. Those are pointed at
+ * the same local stack here, so the browser and the API fixtures share one
+ * database. Only the publishable (anon) key is ever propagated — never a
+ * service-role key.
  */
-function loadEnvLocal(): void {
-  try {
-    const raw = readFileSync(resolve(process.cwd(), '.env.local'), 'utf8');
-    for (const line of raw.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const eq = trimmed.indexOf('=');
-      if (eq === -1) continue;
-      const key = trimmed.slice(0, eq).trim();
-      const value = trimmed.slice(eq + 1).trim();
-      if (!(key in process.env)) process.env[key] = value;
-    }
-  } catch {
-    // No .env.local: tests that need Supabase will skip themselves.
-  }
-}
 
-loadEnvLocal();
+// Propagate the validated local configuration to the Vite dev server. If the
+// configuration is missing or remote, readE2EConfig throws and the run fails
+// loudly rather than silently skipping every test.
+const e2eConfig = readE2EConfig();
+process.env.VITE_SUPABASE_URL = e2eConfig.url;
+process.env.VITE_SUPABASE_PUBLISHABLE_KEY = e2eConfig.publishableKey;
 
-/**
- * End-to-end tests run against the bizpilot-test project.
- * They are skipped automatically when VITE_SUPABASE_URL is not configured.
- */
 export default defineConfig({
   testDir: './tests/e2e',
   fullyParallel: false,

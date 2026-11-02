@@ -14,10 +14,9 @@
  */
 
 import { expect, test } from '@playwright/test';
-import { E2E_PASSWORD, isSupabaseConfigured, loadAccounts, syntheticEmail } from './fixtures';
+import { E2E_PASSWORD, loadAccounts, syntheticEmail } from './fixtures';
 
 test.describe('Authentication', () => {
-  test.skip(!isSupabaseConfigured(), 'Supabase is not configured');
 
   test('signup rejects mismatched passwords', async ({ page }) => {
     await page.goto('/signup');
