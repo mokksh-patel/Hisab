@@ -143,67 +143,99 @@ alter table public.invoice_items
 
 -- Backfill: existing items used percentage discounts only.
 --
--- WHY THIS NEEDS A TRIGGER BYPASS
+-- WHY THIS DOES NOT TOUCH ISSUED INVOICES
 -- `invoice_items_guard_change` rejects ANY update to a line item whose parent
 -- invoice is not a draft. Every historical line item belongs to an issued
 -- invoice, so a plain UPDATE fails with:
 --     'Line items of an issued invoice cannot be changed' (SQLSTATE 22023)
 --
--- The bypass is deliberately narrow:
---   * It disables ONLY `invoice_items_guard_change`.
---   * It runs inside a DO block, which is a single transaction — if anything
---     raises, the whole block rolls back and the trigger is restored.
---   * The trigger is re-enabled in the same block, before it can commit.
---   * It touches ONLY the two new metadata columns. No financial column
---     (quantity, price, taxable, tax, line_total) is modified.
---   * It only runs when there is actually something to backfill, so a fresh
---     database never disables the trigger at all.
+-- Rather than disable that guard — even briefly — the backfill is split:
 --
--- The alternative — a legacy-field fallback that never writes to issued rows —
--- was rejected because `discount_type`/`discount_value` would then be wrong for
--- historical rows, and every future read would need a COALESCE fallback. That
--- spreads the compatibility burden across the whole application instead of
--- confining it to one migration statement.
+--   1. DRAFT items are updated directly. The guard permits this by design.
+--   2. ISSUED items are left untouched. Their discount metadata is derived at
+--      read time from `discount_percent_basis_points`, which is the field they
+--      have always carried. A view (`invoice_item_discounts`) exposes the
+--      derived values so no application code needs a COALESCE.
+--
+-- This keeps issued invoices byte-for-byte immutable, which is the whole point
+-- of the guard. The cost is one extra view; the benefit is that no migration
+-- ever weakens a financial control.
+--
+-- WHY NOT A TRIGGER BYPASS
+-- A bypass would work, but it means the migration temporarily disables the
+-- exact protection that stops financial history being rewritten. If the
+-- migration crashed between disable and enable, the table would be left
+-- unprotected. The fallback has no such window.
+
+-- 1. Draft items: safe to update, the guard allows it.
+update public.invoice_items ii
+set discount_type = case
+      when ii.discount_percent_basis_points > 0 then 'percent'::public.discount_type
+      else 'none'::public.discount_type
+    end,
+    discount_value = ii.discount_percent_basis_points
+from public.invoices i
+where i.id = ii.invoice_id
+  and i.document_state = 'draft'
+  and ii.discount_type = 'none'
+  and ii.discount_value = 0;
+
+-- 2. Issued items: deliberately NOT updated. Record how many rely on the
+--    fallback so the number is visible in the migration log.
 do $$
 declare
-  v_pending integer;
+  v_issued integer;
 begin
-  select count(*) into v_pending
-  from public.invoice_items
-  where discount_type = 'none' and discount_value = 0;
+  select count(*) into v_issued
+  from public.invoice_items ii
+  join public.invoices i on i.id = ii.invoice_id
+  where i.document_state <> 'draft'
+    and ii.discount_type = 'none'
+    and ii.discount_value = 0
+    and ii.discount_percent_basis_points > 0;
 
-  if v_pending = 0 then
-    raise notice 'invoice_items backfill: nothing to do';
-    return;
+  if v_issued > 0 then
+    raise notice
+      'invoice_items: % issued line(s) keep discount metadata in discount_percent_basis_points and are read through invoice_item_discounts',
+      v_issued;
   end if;
-
-  -- Narrow, transactional bypass of the immutability guard.
-  alter table public.invoice_items disable trigger invoice_items_guard_change;
-
-  begin
-    update public.invoice_items
-    set discount_type = case
-          when discount_percent_basis_points > 0 then 'percent'::public.discount_type
-          else 'none'::public.discount_type
-        end,
-        discount_value = discount_percent_basis_points
-    where discount_type = 'none' and discount_value = 0;
-
-    raise notice 'invoice_items backfill: % row(s) updated', v_pending;
-  exception
-    when others then
-      -- Restore the guard before propagating, so a failure never leaves the
-      -- table unprotected.
-      alter table public.invoice_items enable trigger invoice_items_guard_change;
-      raise;
-  end;
-
-  -- Always restore the guard. This runs before the block commits.
-  alter table public.invoice_items enable trigger invoice_items_guard_change;
 end;
 $$;
 
--- Prove the guard is active again. If this fails, the migration aborts.
+-- 3. A view that presents the effective discount for every line, whether the
+--    metadata was written (draft) or derived (issued). Application code reads
+--    this instead of the raw columns.
+create or replace view public.invoice_item_discounts
+with (security_invoker = true)
+as
+select
+  ii.id as invoice_item_id,
+  ii.business_id,
+  ii.invoice_id,
+  ii.discount_percent_basis_points,
+  ii.discount_paise,
+  -- Effective type: the stored value when it was written, otherwise derived
+  -- from the legacy percentage field.
+  case
+    when ii.discount_type <> 'none' then ii.discount_type
+    when ii.discount_percent_basis_points > 0 then 'percent'::public.discount_type
+    else 'none'::public.discount_type
+  end as effective_discount_type,
+  -- Effective raw value: basis points for percent, paise for fixed.
+  case
+    when ii.discount_type <> 'none' then ii.discount_value
+    when ii.discount_percent_basis_points > 0 then ii.discount_percent_basis_points::numeric(20,0)
+    else 0::numeric(20,0)
+  end as effective_discount_value
+from public.invoice_items ii;
+
+comment on view public.invoice_item_discounts is
+  'Effective discount metadata for every invoice line. Issued lines derive it from discount_percent_basis_points because they are immutable.';
+
+grant select on public.invoice_item_discounts to authenticated;
+
+-- Safety assertion: the immutability guard must be enabled. This migration
+-- never disables it, so a failure here means something else changed it.
 do $$
 declare
   v_enabled "char";
@@ -215,7 +247,7 @@ begin
 
   if v_enabled is null or v_enabled = 'D' then
     raise exception
-      'invoice_items_guard_change is not enabled after the backfill — aborting migration'
+      'invoice_items_guard_change is not enabled — aborting migration'
       using errcode = '22023';
   end if;
 end;

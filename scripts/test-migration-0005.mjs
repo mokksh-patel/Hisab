@@ -1,19 +1,19 @@
 /**
- * test-migration-0005.mjs — dry-run the migration logic in a throwaway schema.
+ * test-migration-0005.mjs — validate the 0005 backfill strategy in a throwaway
+ * schema.
  *
- * SAFETY: this never touches `public`. It creates a schema `mig_test`, builds
- * the pre-0005 table shapes, applies the migration's backfill logic, verifies
- * the result, then drops the schema.
+ * SAFETY: never touches `public`. Creates schema `mig_test`, reproduces the
+ * pre-0005 shape, applies the migration's backfill logic, verifies, then drops.
  *
- * It does NOT execute the real migration file (which targets `public`). It
- * reproduces the specific statements that failed so the fix can be proven
- * without touching the live database.
+ * It proves the chosen approach: draft items are updated, issued items are left
+ * untouched and read through a fallback view, and the immutability guard is
+ * never disabled.
  *
  * Usage: node scripts/test-migration-0005.mjs
  */
 
 import { execSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const FORBIDDEN_REF = 'gdhaszmgwowfxgxllpva';
@@ -33,8 +33,6 @@ function runQuery(sql) {
   return JSON.parse(output.slice(start, end + 1));
 }
 
-// --- Safety ----------------------------------------------------------------
-import { readFileSync } from 'node:fs';
 const ref = readFileSync('supabase/.temp/project-ref', 'utf8').trim();
 if (ref === FORBIDDEN_REF) {
   console.error(`REFUSING: linked project is production (${ref})`);
@@ -42,7 +40,7 @@ if (ref === FORBIDDEN_REF) {
 }
 console.log(`Migration logic test against ${ref} (schema: ${SCHEMA})\n`);
 
-// --- Setup: reproduce the pre-0005 shape -----------------------------------
+// --- Setup -----------------------------------------------------------------
 runQuery(`drop schema if exists ${SCHEMA} cascade;`);
 runQuery(`create schema ${SCHEMA};`);
 
@@ -56,6 +54,7 @@ runQuery(`
 runQuery(`
   create table ${SCHEMA}.invoice_items (
     id uuid primary key,
+    business_id uuid not null,
     invoice_id uuid not null references ${SCHEMA}.invoices (id),
     discount_percent_basis_points integer not null default 0,
     discount_paise numeric(20,0) not null default 0,
@@ -64,7 +63,6 @@ runQuery(`
   );
 `);
 
-// The guard that caused the failure.
 runQuery(`
   create or replace function ${SCHEMA}.guard_invoice_item_change()
   returns trigger language plpgsql as $$
@@ -86,9 +84,7 @@ runQuery(`
     for each row execute function ${SCHEMA}.guard_invoice_item_change();
 `);
 
-// --- Prove the naive UPDATE fails ------------------------------------------
-// The guard fires on the seed INSERT too, so the seed must run with the trigger
-// disabled. We re-enable it immediately after seeding.
+// --- Seed ------------------------------------------------------------------
 runQuery(`
   insert into ${SCHEMA}.invoices (id, document_state) values
     ('11111111-1111-1111-1111-111111111111', 'issued'),
@@ -96,106 +92,95 @@ runQuery(`
     ('33333333-3333-3333-3333-333333333333', 'draft');
 `);
 
+// Seed with the guard disabled (it also blocks INSERT into issued invoices).
 runQuery(`alter table ${SCHEMA}.invoice_items disable trigger invoice_items_guard_change;`);
-
 runQuery(`
   insert into ${SCHEMA}.invoice_items
-    (id, invoice_id, discount_percent_basis_points, discount_paise, taxable_amount_paise, line_total_paise)
+    (id, business_id, invoice_id, discount_percent_basis_points, discount_paise, taxable_amount_paise, line_total_paise)
   values
-    ('a0000000-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111111', 0,    0,     500000, 590000),
-    ('a0000000-0000-0000-0000-000000000002', '11111111-1111-1111-1111-111111111111', 1000, 10000, 90000,  106200),
-    ('a0000000-0000-0000-0000-000000000003', '22222222-2222-2222-2222-222222222222', 500,  2500,  47500,  56050),
-    ('a0000000-0000-0000-0000-000000000004', '33333333-3333-3333-3333-333333333333', 0,    0,     10000,  11800);
+    ('a0000000-0000-0000-0000-000000000001', 'b0000000-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111111', 0,    0,     500000, 590000),
+    ('a0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111111', 1000, 10000, 90000,  106200),
+    ('a0000000-0000-0000-0000-000000000003', 'b0000000-0000-0000-0000-000000000001', '22222222-2222-2222-2222-222222222222', 500,  2500,  47500,  56050),
+    ('a0000000-0000-0000-0000-000000000004', 'b0000000-0000-0000-0000-000000000001', '33333333-3333-3333-3333-333333333333', 1000, 1000,  9000,   10620);
 `);
-
 runQuery(`alter table ${SCHEMA}.invoice_items enable trigger invoice_items_guard_change;`);
 
 const before = runQuery(`
-  select
-    count(*)::int as items,
-    sum(taxable_amount_paise)::text as taxable,
-    sum(line_total_paise)::text as total,
-    sum(discount_paise)::text as discount
+  select count(*)::int as items,
+         sum(taxable_amount_paise)::text as taxable,
+         sum(line_total_paise)::text as total,
+         sum(discount_paise)::text as discount
   from ${SCHEMA}.invoice_items;
 `);
-console.log('BEFORE backfill:', JSON.stringify(before[0]));
+console.log('BEFORE:', JSON.stringify(before[0]));
 
-let naiveFailed = false;
-try {
-  runQuery(`
-    update ${SCHEMA}.invoice_items
-    set discount_percent_basis_points = discount_percent_basis_points
-    where invoice_id = '11111111-1111-1111-1111-111111111111';
-  `);
-} catch (error) {
-  naiveFailed = true;
-  console.log('CONFIRMED: a plain UPDATE on issued items is rejected by the guard');
-}
-
-if (!naiveFailed) {
-  console.error('UNEXPECTED: the guard did not reject the update');
-  runQuery(`drop schema ${SCHEMA} cascade;`);
-  process.exit(1);
-}
-
-// --- Apply the migration's backfill logic ----------------------------------
+// --- Apply the migration's approach ----------------------------------------
 runQuery(`
   alter table ${SCHEMA}.invoice_items add column discount_type text not null default 'none';
   alter table ${SCHEMA}.invoice_items add column discount_value numeric(20,0) not null default 0;
 `);
 
+// 1. Draft items only — the guard permits this.
 runQuery(`
-  do $$
-  declare v_pending integer;
-  begin
-    select count(*) into v_pending
-    from ${SCHEMA}.invoice_items
-    where discount_type = 'none' and discount_value = 0;
+  update ${SCHEMA}.invoice_items ii
+  set discount_type = case
+        when ii.discount_percent_basis_points > 0 then 'percent'
+        else 'none'
+      end,
+      discount_value = ii.discount_percent_basis_points
+  from ${SCHEMA}.invoices i
+  where i.id = ii.invoice_id
+    and i.document_state = 'draft'
+    and ii.discount_type = 'none'
+    and ii.discount_value = 0;
+`);
 
-    if v_pending = 0 then
-      raise notice 'nothing to do';
-      return;
-    end if;
-
-    alter table ${SCHEMA}.invoice_items disable trigger invoice_items_guard_change;
-
-    begin
-      update ${SCHEMA}.invoice_items
-      set discount_type = case
-            when discount_percent_basis_points > 0 then 'percent'
-            else 'none'
-          end,
-          discount_value = discount_percent_basis_points
-      where discount_type = 'none' and discount_value = 0;
-    exception
-      when others then
-        alter table ${SCHEMA}.invoice_items enable trigger invoice_items_guard_change;
-        raise;
-    end;
-
-    alter table ${SCHEMA}.invoice_items enable trigger invoice_items_guard_change;
-  end;
-  $$;
+// 2. Fallback view for issued items.
+runQuery(`
+  create or replace view ${SCHEMA}.invoice_item_discounts as
+  select
+    ii.id as invoice_item_id,
+    ii.business_id,
+    ii.invoice_id,
+    ii.discount_percent_basis_points,
+    ii.discount_paise,
+    case
+      when ii.discount_type <> 'none' then ii.discount_type
+      when ii.discount_percent_basis_points > 0 then 'percent'
+      else 'none'
+    end as effective_discount_type,
+    case
+      when ii.discount_type <> 'none' then ii.discount_value
+      when ii.discount_percent_basis_points > 0 then ii.discount_percent_basis_points::numeric(20,0)
+      else 0::numeric(20,0)
+    end as effective_discount_value
+  from ${SCHEMA}.invoice_items ii;
 `);
 
 // --- Verify ----------------------------------------------------------------
 const after = runQuery(`
-  select
-    count(*)::int as items,
-    sum(taxable_amount_paise)::text as taxable,
-    sum(line_total_paise)::text as total,
-    sum(discount_paise)::text as discount
+  select count(*)::int as items,
+         sum(taxable_amount_paise)::text as taxable,
+         sum(line_total_paise)::text as total,
+         sum(discount_paise)::text as discount
   from ${SCHEMA}.invoice_items;
 `);
-console.log('AFTER  backfill:', JSON.stringify(after[0]));
+console.log('AFTER: ', JSON.stringify(after[0]));
 
-const mapping = runQuery(`
-  select discount_percent_basis_points as bp, discount_type, discount_value::text as val
-  from ${SCHEMA}.invoice_items order by discount_percent_basis_points;
+const effective = runQuery(`
+  select d.invoice_item_id, i.document_state,
+         d.discount_percent_basis_points as bp,
+         d.effective_discount_type as eff_type,
+         d.effective_discount_value::text as eff_val
+  from ${SCHEMA}.invoice_item_discounts d
+  join ${SCHEMA}.invoices i on i.id = d.invoice_id
+  order by d.invoice_item_id;
 `);
-console.log('\nDISCOUNT MAPPING:');
-for (const row of mapping) {
-  console.log(`  bp=${row.bp} -> type=${row.discount_type} value=${row.val}`);
+console.log('\nEFFECTIVE DISCOUNT (via view):');
+for (const row of effective) {
+  console.log(
+    `  ${row.document_state.padEnd(6)} bp=${String(row.bp).padStart(4)} -> ${row.eff_type.padEnd(7)} value=${row.eff_val}`,
+  );
 }
 
 const triggerState = runQuery(`
@@ -203,31 +188,42 @@ const triggerState = runQuery(`
   where tgname = 'invoice_items_guard_change'
     and tgrelid = '${SCHEMA}.invoice_items'::regclass;
 `);
-console.log(`\nTRIGGER STATE AFTER: ${triggerState[0]?.tgenabled} (O = enabled)`);
+console.log(`\nTRIGGER STATE: ${triggerState[0]?.tgenabled} (O = enabled)`);
 
-// Guard must still reject updates to issued items.
-let guardStillWorks = false;
+// Guard must still block issued items.
+let guardBlocks = false;
 try {
   runQuery(`
     update ${SCHEMA}.invoice_items set discount_value = 999
     where invoice_id = '11111111-1111-1111-1111-111111111111';
   `);
 } catch {
-  guardStillWorks = true;
+  guardBlocks = true;
 }
-console.log(`GUARD STILL BLOCKS ISSUED ITEMS: ${guardStillWorks}`);
+console.log(`GUARD BLOCKS ISSUED ITEMS: ${guardBlocks}`);
 
 // Draft items must still be editable.
 let draftEditable = true;
 try {
   runQuery(`
-    update ${SCHEMA}.invoice_items set discount_value = 0
+    update ${SCHEMA}.invoice_items set discount_value = 1000
     where invoice_id = '33333333-3333-3333-3333-333333333333';
   `);
 } catch {
   draftEditable = false;
 }
-console.log(`DRAFT ITEMS STILL EDITABLE: ${draftEditable}`);
+console.log(`DRAFT ITEMS EDITABLE: ${draftEditable}`);
+
+// Issued items must be byte-identical to before.
+const issuedUnchanged = runQuery(`
+  select count(*)::int as n
+  from ${SCHEMA}.invoice_items ii
+  join ${SCHEMA}.invoices i on i.id = ii.invoice_id
+  where i.document_state <> 'draft'
+    and ii.discount_type = 'none'
+    and ii.discount_value = 0;
+`);
+console.log(`ISSUED ITEMS UNTOUCHED: ${issuedUnchanged[0]?.n === 3} (${issuedUnchanged[0]?.n} of 3)`);
 
 // --- Cleanup ---------------------------------------------------------------
 runQuery(`drop schema ${SCHEMA} cascade;`);
@@ -238,11 +234,17 @@ const financialsUnchanged =
   before[0].total === after[0].total &&
   before[0].discount === after[0].discount;
 
-console.log(`\nFINANCIALS UNCHANGED: ${financialsUnchanged}`);
-console.log(`TRIGGER RESTORED: ${triggerState[0]?.tgenabled === 'O'}`);
-console.log(`GUARD INTACT: ${guardStillWorks}`);
-console.log(`DRAFT EDITABLE: ${draftEditable}`);
+const pass =
+  financialsUnchanged &&
+  triggerState[0]?.tgenabled === 'O' &&
+  guardBlocks &&
+  draftEditable &&
+  issuedUnchanged[0]?.n === 3;
 
-const pass = financialsUnchanged && triggerState[0]?.tgenabled === 'O' && guardStillWorks && draftEditable;
+console.log(`\nFINANCIALS UNCHANGED: ${financialsUnchanged}`);
+console.log(`TRIGGER ENABLED: ${triggerState[0]?.tgenabled === 'O'}`);
+console.log(`GUARD INTACT: ${guardBlocks}`);
+console.log(`DRAFT EDITABLE: ${draftEditable}`);
+console.log(`ISSUED UNTOUCHED: ${issuedUnchanged[0]?.n === 3}`);
 console.log(`\n${pass ? 'ALL CHECKS PASSED' : 'CHECKS FAILED'}`);
 process.exit(pass ? 0 : 1);
