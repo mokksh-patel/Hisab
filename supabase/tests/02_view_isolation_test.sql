@@ -260,20 +260,32 @@ select is(
 
 -- ===========================================================================
 -- 4. Unauthenticated access to the views is denied
+--
+--   invoice_balances and customer_receivables are declared with
+--   security_invoker = true, so they read the underlying tables with the
+--   CALLER's privileges. anon holds no SELECT on public.invoices (revoked in
+--   migration 0005) and no SELECT on the views themselves (granted only to
+--   authenticated in migration 0002), so the query is rejected with 42501
+--   instead of returning zero rows.
+--
+--   security_invoker is deliberately left true: flipping it to false would
+--   make the views run as their owner and bypass tenant RLS entirely.
 -- ===========================================================================
 set local role anon;
 set local request.jwt.claims = '{"role":"anon"}';
 
-select is(
-  (select count(*)::int from public.invoice_balances),
-  0,
-  'invoice_balances: anon sees no rows'
+select throws_ok(
+  $$ select count(*) from public.invoice_balances $$,
+  '42501',
+  null,
+  'invoice_balances: anon is denied by privilege'
 );
 
-select is(
-  (select count(*)::int from public.customer_receivables),
-  0,
-  'customer_receivables: anon sees no rows'
+select throws_ok(
+  $$ select count(*) from public.customer_receivables $$,
+  '42501',
+  null,
+  'customer_receivables: anon is denied by privilege'
 );
 
 reset role;

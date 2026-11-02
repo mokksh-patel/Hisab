@@ -194,9 +194,14 @@ select is(
   'An unauthenticated user cannot read customers'
 );
 
-select is(
-  (select count(*)::int from public.invoices),
-  0,
+-- public.invoices is revoked from anon entirely (migration 0005, section 4b),
+-- so the statement fails at the privilege check with 42501 rather than
+-- returning zero rows. Asserting the denial is the stronger claim: it proves
+-- anon holds no SELECT privilege at all, not merely that RLS filtered rows.
+select throws_ok(
+  $$ select count(*) from public.invoices $$,
+  '42501',
+  null,
   'An unauthenticated user cannot read invoices'
 );
 

@@ -296,6 +296,15 @@ select is(
   'a composition taxpayer IS GST-registered'
 );
 
+-- These two assertions target the GST consistency CHECK constraint itself, not
+-- the client's authorization to insert businesses. Under `authenticated` the
+-- table ACL rejects the INSERT with 42501 before the constraint is ever
+-- evaluated, which would test the wrong thing. The role is therefore reset to
+-- the privileged database test role for the duration of these two inserts.
+-- The separate proof that authenticated clients cannot create businesses by
+-- direct INSERT is section 7e below.
+reset role;
+
 select throws_ok(
   $$ insert into public.businesses (legal_name, display_name, is_gst_registered, gst_scheme)
      values ('Bad Co', 'Bad Co', false, 'composition') $$,
@@ -311,6 +320,10 @@ select throws_ok(
   null,
   'regular scheme with is_gst_registered = false is rejected by the constraint'
 );
+
+-- Restore the client context for the remaining RPC-level assertions.
+set local role authenticated;
+set local request.jwt.claims = '{"sub":"c1111111-1111-1111-1111-111111111111","role":"authenticated"}';
 
 select throws_ok(
   $$ select public.create_invoice(
@@ -428,11 +441,28 @@ select is(
 
 -- ===========================================================================
 -- 7. Immutability of the new columns on issued invoices
+--
+--   Two distinct protections are tested separately throughout section 7:
+--
+--     A. Client authorization — authenticated holds no INSERT/UPDATE/DELETE on
+--        public.invoices (migration 0005, section 4b), so a direct client write
+--        fails with 42501 before any trigger runs. Proven in 7e.
+--
+--     B. Database integrity — guard_invoice_update() and the CHECK constraints
+--        still reject unauthorized changes when TRUSTED database code performs
+--        a direct UPDATE. Proven in 7a-7d, which therefore run as the
+--        privileged database test role.
+--
+--   Running 7a-7d as `authenticated` would only re-prove (A): the ACL would
+--   reject every statement with 42501 and the trigger would never fire.
 -- ===========================================================================
 select lives_ok(
   $$ select public.issue_invoice((select id from public.invoices where invoice_number = 'V2-EXCL-001')) $$,
   'invoice can be issued'
 );
+
+-- Trusted database-owner context: exercises the trigger, not the client ACL.
+reset role;
 
 select throws_ok(
   $$ update public.invoices set price_includes_tax = true
@@ -516,7 +546,14 @@ select throws_ok(
 --
 --   A dedicated invoice is used so the void below does not disturb the
 --   V2-EXCL-001 assertions that follow.
+--
+--   The invoice is created and issued through the authenticated RPCs, then the
+--   role is reset to the privileged database test role so the direct UPDATEs
+--   below reach guard_invoice_update() instead of being stopped by the ACL.
 -- ===========================================================================
+set local role authenticated;
+set local request.jwt.claims = '{"sub":"c1111111-1111-1111-1111-111111111111","role":"authenticated"}';
+
 select lives_ok(
   $$ select public.create_invoice(
        'c0000000-0000-0000-0000-00000000000a',
@@ -533,6 +570,9 @@ select lives_ok(
   'the lifecycle test invoice is issued'
 );
 
+-- Trusted database-owner context for the trigger assertions below.
+reset role;
+
 -- document_state: issued -> draft is rejected by the guard.
 select throws_ok(
   $$ update public.invoices set document_state = 'draft'
@@ -542,21 +582,25 @@ select throws_ok(
   'document_state cannot go from issued back to draft'
 );
 
--- issued_at: clearing it on an issued invoice violates the timestamp constraint.
+-- issued_at: clearing it on an issued invoice is rejected by
+-- guard_invoice_update() with 22023. The trigger fires before the
+-- invoices_issued_requires_timestamp CHECK constraint, so 23514 is never
+-- reached here.
 select throws_ok(
   $$ update public.invoices set issued_at = null
      where invoice_number = 'V2-LIFECYCLE-001' $$,
-  '23514',
+  '22023',
   null,
   'issued_at cannot be cleared while the invoice is issued'
 );
 
--- voided_at / void_reason: setting them without moving to void violates the
--- void-reason constraint.
+-- voided_at / void_reason: setting them without moving to void is likewise
+-- rejected by guard_invoice_update() with 22023, ahead of the
+-- invoices_void_requires_reason CHECK constraint.
 select throws_ok(
   $$ update public.invoices set voided_at = now()
      where invoice_number = 'V2-LIFECYCLE-001' $$,
-  '23514',
+  '22023',
   null,
   'voided_at cannot be set on a non-void invoice'
 );
@@ -564,7 +608,7 @@ select throws_ok(
 select throws_ok(
   $$ update public.invoices set void_reason = 'sneaky'
      where invoice_number = 'V2-LIFECYCLE-001' $$,
-  '23514',
+  '22023',
   null,
   'void_reason cannot be set on a non-void invoice'
 );
@@ -685,15 +729,24 @@ select throws_ok(
 );
 
 -- A draft invoice may still be edited freely (no lifecycle fields set yet).
+--
+-- This is a TRUSTED DATABASE-OWNER operation, not a client capability:
+-- authenticated holds no UPDATE on public.invoices at all. The assertion proves
+-- guard_invoice_update() does not over-block legitimate draft edits performed
+-- by trusted code; it does NOT mean a client can edit a draft directly.
 select lives_ok(
   $$ update public.invoices
      set notes = 'draft note'
      where invoice_number = 'V2-HISTORIC-001' $$,
-  'a draft invoice can still be edited'
+  'a draft invoice can still be edited by trusted database code'
 );
 
 -- ===========================================================================
 -- 7e. RPC bypass attempts
+--
+--   Restore the client context: everything from here on must be evaluated as
+--   `authenticated`, because these assertions prove the CLIENT cannot bypass
+--   the RPCs.
 --
 --   RLS on public.invoices is:
 --     invoices_update_writer FOR UPDATE TO authenticated
@@ -701,15 +754,25 @@ select lives_ok(
 --       WITH CHECK (can_write_financials(business_id))
 --
 --   RLS checks WHO may update and WHICH ROWS, not WHICH COLUMNS. Migration 0005
---   therefore revokes table-level UPDATE from `authenticated` and grants UPDATE
---   only on the non-lifecycle columns. document_state, issued_at, voided_at and
---   void_reason are NOT granted, so a direct client UPDATE fails with 42501
---   (insufficient_privilege) BEFORE any trigger runs.
+--   therefore revokes ALL table privileges from `authenticated` and grants back
+--   only SELECT:
+--
+--     revoke all on public.invoices from public;
+--     revoke all on public.invoices from anon;
+--     revoke all on public.invoices from authenticated;
+--     grant select on public.invoices to authenticated;
+--
+--   It does NOT grant UPDATE on the non-lifecycle columns. No column of
+--   public.invoices is directly writable by a client role, so every direct
+--   client write below fails with 42501 (insufficient_privilege) BEFORE any
+--   trigger or RLS policy is evaluated.
 --
 --   The SECURITY DEFINER functions issue_invoice() / void_invoice() run as the
 --   function owner and retain full UPDATE privilege, so the supported
 --   workflows are unaffected.
 -- ===========================================================================
+set local role authenticated;
+set local request.jwt.claims = '{"sub":"c1111111-1111-1111-1111-111111111111","role":"authenticated"}';
 
 -- A fresh draft, used to attempt a direct draft -> issued bypass.
 select lives_ok(
@@ -1159,11 +1222,20 @@ select is(
 --   legacy column directly, then issue the invoice. After issue the row is
 --   frozen, which is exactly the historical shape.
 --
+--   The direct UPDATE of public.invoice_items is performed as the privileged
+--   database test role: authenticated holds no UPDATE on invoice_items
+--   (migration 0005, section 4c), so a client could never write this row. The
+--   fixture therefore represents a genuine legacy row written by trusted code,
+--   which is precisely the shape the view must remain compatible with.
+--
 --   The invoice_item_discounts view must then derive the effective discount
 --   from discount_percent_basis_points. If the view's fallback CASE were
 --   removed, effective_discount_type would be 'none' and
 --   effective_discount_value would be 0, so these assertions would fail.
 -- ===========================================================================
+set local role authenticated;
+set local request.jwt.claims = '{"sub":"c1111111-1111-1111-1111-111111111111","role":"authenticated"}';
+
 select lives_ok(
   $$ select public.create_invoice(
        'c0000000-0000-0000-0000-00000000000a',
@@ -1175,15 +1247,21 @@ select lives_ok(
   'a draft invoice is created for the historical-discount test'
 );
 
--- While still a draft, force the legacy shape: metadata unset, legacy column set.
+-- Trusted database-owner context: write the legacy shape while still a draft.
+reset role;
+
 select lives_ok(
   $$ update public.invoice_items
      set discount_type = 'none',
          discount_value = 0,
          discount_percent_basis_points = 1000
      where invoice_id = (select id from public.invoices where invoice_number = 'V2-HISTORIC-001') $$,
-  'a draft line can be set to the legacy shape'
+  'a draft line can be set to the legacy shape by trusted database code'
 );
+
+-- Back to the client context to issue through the supported RPC.
+set local role authenticated;
+set local request.jwt.claims = '{"sub":"c1111111-1111-1111-1111-111111111111","role":"authenticated"}';
 
 select lives_ok(
   $$ select public.issue_invoice((select id from public.invoices where invoice_number = 'V2-HISTORIC-001')) $$,
@@ -1497,6 +1575,13 @@ select is(
 );
 
 -- Issued line items must remain immutable.
+--
+-- These three assertions target invoice_items_guard_change, so they run as the
+-- privileged database test role. As `authenticated` the table ACL would reject
+-- the UPDATE with 42501 before the trigger could fire, which would prove the
+-- client ACL (already proven in 7g) rather than the trigger.
+reset role;
+
 select throws_ok(
   $$ update public.invoice_items set discount_type = 'fixed'
      where invoice_id = (select id from public.invoices where invoice_number = 'V2-EXCL-001') $$,
@@ -1520,6 +1605,10 @@ select throws_ok(
   null,
   'cess_rate_basis_points cannot change on an issued invoice line'
 );
+
+-- Restore the client context for the GST authorization tests that follow.
+set local role authenticated;
+set local request.jwt.claims = '{"sub":"c1111111-1111-1111-1111-111111111111","role":"authenticated"}';
 
 -- ===========================================================================
 -- 9. GST scheme confirmation authorization
