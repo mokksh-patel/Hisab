@@ -318,7 +318,10 @@ select throws_ok(
   'a composition business cannot issue a tax invoice'
 );
 
-select lives_ok(
+-- A composition supply is taxable at a flat rate, NOT exempt. Until Bill of
+-- Supply exists, a composition business must not be able to record the supply
+-- at all — recording it as exempt would misstate the tax position.
+select throws_ok(
   $$ select public.create_invoice(
        'c0000000-0000-0000-0000-00000000000b',
        'c0000000-0000-0000-0000-0000000000c2',
@@ -326,7 +329,9 @@ select lives_ok(
        '[{"description":"Widget","quantity":"1","unit_price_paise":"1000","tax_rate_basis_points":0}]'::jsonb,
        null, 'V2-COMP-EXEMPT'
      ) $$,
-  'a composition business may issue an exempt invoice'
+  '22023',
+  null,
+  'a composition business cannot record a supply as exempt either'
 );
 
 select throws_ok(

@@ -248,7 +248,7 @@ begin
 
     if v_business.gst_scheme = 'composition' then
       raise exception
-        'A composition-scheme business cannot issue a tax invoice or collect GST. Bill of Supply is not yet supported — record this invoice as exempt supply.'
+        'A composition-scheme business cannot issue a tax invoice or collect GST from customers. Bill of Supply is not yet supported in BizPilot, so this invoice cannot be created. Do not record it as exempt supply — a composition supply is taxable at a flat rate, not exempt.'
         using errcode = '22023';
     end if;
     if v_business.gst_scheme = 'unregistered' then
