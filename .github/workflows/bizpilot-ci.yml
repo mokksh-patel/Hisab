@@ -13,8 +13,10 @@
 #   * No `db push`, no `db reset`, no `migration repair`, no `link`.
 #     `supabase start` is what applies the migrations, to a throwaway
 #     container that is destroyed with the runner.
-#   * Failures are reported, never suppressed: no `|| true`, no
-#     `continue-on-error`, no `--ignore-health-check`.
+#   * Failures are reported, never suppressed: no `continue-on-error`, no
+#     `--ignore-health-check`, and no `|| true` on any verification check.
+#     The only tolerated non-zero status is the best-effort `supabase stop`
+#     teardown, which runs under `if: always()` after the job result is set.
 # ===========================================================================
 
 name: BizPilot CI
@@ -51,15 +53,16 @@ jobs:
   # -------------------------------------------------------------------------
   app:
     name: App (install, unit tests, type-check, build)
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest so the image cannot change under us.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -81,15 +84,15 @@ jobs:
   # -------------------------------------------------------------------------
   database:
     name: Database (migrations + pgTAP)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Supabase CLI
-        uses: supabase/setup-cli@v1
+        uses: supabase/setup-cli@v3
         with:
           version: ${{ env.SUPABASE_CLI_VERSION }}
 
@@ -106,32 +109,66 @@ jobs:
         run: |
           supabase start --exclude gotrue,realtime,storage-api,imgproxy,kong,mailpit,postgrest,postgres-meta,studio,edge-runtime,logflare,vector,supavisor
 
+      # Reads applied versions straight from the local migration-history table
+      # instead of scraping `supabase migration list`. That command renders a
+      # Unicode box-drawing table, so an ASCII-pipe parser silently yields
+      # nothing. `db query --local` is local-only and needs no access token.
       - name: Verify every migration was applied in order
         run: |
           set -euo pipefail
 
           # Expected: the migration files on disk, sorted by version.
           expected="$(ls supabase/migrations/*.sql | xargs -n1 basename | sed 's/_.*//' | sort)"
-          echo "Migration files on disk:"
-          echo "$expected"
 
           # Actual: versions recorded in the local migration history table.
-          applied="$(supabase migration list --local | awk -F'|' 'NF>=2 {gsub(/ /,"",$1); if ($1 ~ /^[0-9]+$/) print $1}' | sort)"
+          # -o csv keeps the payload machine-readable. The CLI also prints a
+          # "Connecting to local database..." banner, so only lines that are
+          # exactly a 14-digit version are kept.
+          #
+          # The query status is captured explicitly so a genuine query failure
+          # (bad connection, missing table, SQL error) fails the step and is
+          # reported differently from "the query succeeded but returned no
+          # versions".
+          query_status=0
+          raw="$(supabase db query --local -o csv \
+            "select version from supabase_migrations.schema_migrations order by version")" || query_status=$?
+
+          if [ "$query_status" -ne 0 ]; then
+            echo "::error::Migration history query failed (exit ${query_status})."
+            echo "Raw query output was:"
+            printf '%s\n' "$raw"
+            exit 1
+          fi
+
+          # `grep` exits 1 when nothing matches. Under `set -e` that would
+          # abort the step before the diagnostic below could run, so the
+          # status is tolerated here and handled explicitly instead.
+          applied="$(printf '%s\n' "$raw" | tr -d '\r' | grep -E '^[0-9]{14}$' | sort)" || true
+
+          echo "Migration files on disk:"
+          printf '%s\n' "$expected"
+          echo
           echo "Versions recorded as applied:"
-          echo "$applied"
+          printf '%s\n' "${applied:-<none>}"
+          echo
 
           if [ -z "$applied" ]; then
-            echo "::error::No migrations are recorded as applied in the local database."
+            echo "::error::No 14-digit migration versions found in supabase_migrations.schema_migrations."
+            echo "Raw query output was:"
+            printf '%s\n' "$raw"
             exit 1
           fi
 
           if [ "$expected" != "$applied" ]; then
             echo "::error::Applied migrations do not match the files on disk."
-            diff <(echo "$expected") <(echo "$applied") || true
+            echo "--- on disk but NOT applied ---"
+            comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$applied")
+            echo "--- applied but NOT on disk ---"
+            comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$applied")
             exit 1
           fi
 
-          echo "All $(echo "$expected" | wc -l) migrations applied in order."
+          echo "All $(printf '%s\n' "$expected" | wc -l) migrations applied in order."
 
       - name: Verify pgTAP test files are discovered
         run: |
@@ -165,6 +202,8 @@ jobs:
       - name: Run pgTAP database tests
         run: supabase test db --local
 
+      # Best-effort teardown only. This runs after every check has already
+      # decided the job result, so it cannot mask a failure.
       - name: Stop local Supabase
         if: always()
         run: supabase stop --no-backup || true

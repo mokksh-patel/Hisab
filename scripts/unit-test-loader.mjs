@@ -9,8 +9,8 @@
  * The test files themselves are NOT modified.
  */
 
-import { pathToFileURL } from 'node:url';
-import { resolve as resolvePath } from 'node:path';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import { resolve as resolvePath, dirname } from 'node:path';
 import { existsSync } from 'node:fs';
 
 const SHIM_URL = pathToFileURL(resolvePath('scripts/vitest-shim.mjs')).href;
@@ -32,8 +32,15 @@ export async function resolve(specifier, context, nextResolve) {
 
   // Relative imports inside src/ are written without extensions (Vite resolves
   // them). Node needs the extension, so try the common ones.
-  if (specifier.startsWith('.') && context.parentURL?.includes('/src/')) {
-    const base = resolvePath(new URL(context.parentURL).pathname.replace(/^\//, ''), '..', specifier);
+  //
+  // The parent URL is converted with fileURLToPath rather than reading
+  // URL.pathname: on Linux the pathname is an absolute POSIX path, and
+  // stripping its leading slash would turn it into a path relative to the
+  // current working directory. fileURLToPath also handles Windows drive
+  // letters and percent-encoded characters correctly.
+  if (specifier.startsWith('.') && context.parentURL?.startsWith('file:')) {
+    const parentPath = fileURLToPath(context.parentURL);
+    const base = resolvePath(dirname(parentPath), specifier);
     for (const candidate of [`${base}.ts`, `${base}.tsx`, `${base}/index.ts`]) {
       if (existsSync(candidate)) {
         return { url: pathToFileURL(candidate).href, shortCircuit: true };
