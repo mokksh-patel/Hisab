@@ -23,7 +23,7 @@
  * customer and invoice, so tests remain independent.
  */
 
-import { execFileSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { existsSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { E2E_PASSWORD, type TestAccount } from './fixtures';
@@ -78,6 +78,93 @@ function randomId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/**
+ * Redacts anything sensitive from CLI/Postgres output before it is reported.
+ *
+ * The goal is a diagnostic that is useful in a CI log without leaking secrets
+ * or the SQL statement. Applied to stderr and stdout alike.
+ */
+export function redactDiagnostic(text: string): string {
+  let out = text;
+
+  // Generated E2E email addresses (e2e+<label>-<stamp>@example.com).
+  out = out.replace(/e2e\+[^\s'"@]*@[^\s'"]*/gi, '<redacted-email>');
+
+  // Any other email address.
+  out = out.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '<redacted-email>');
+
+  // bcrypt hashes ($2a$/$2b$/$2y$...) and any other crypt() output.
+  out = out.replace(/\$2[aby]?\$\d{2}\$[./A-Za-z0-9]{53}/g, '<redacted-hash>');
+
+  // JWTs (three base64url segments) — covers anon, service-role and any token.
+  out = out.replace(/eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*/g, '<redacted-jwt>');
+
+  // Supabase publishable/secret keys.
+  out = out.replace(/sb_(publishable|secret)_[A-Za-z0-9_-]+/g, '<redacted-key>');
+
+  // Connection strings / passwords.
+  out = out.replace(/postgres(ql)?:\/\/[^\s'"]+/gi, '<redacted-db-url>');
+  out = out.replace(/(password|passwd|pwd)\s*=\s*[^\s'";]+/gi, '$1=<redacted>');
+
+  // The E2E password constant, in case it ever appears verbatim.
+  out = out.split(E2E_PASSWORD).join('<redacted-password>');
+
+  return out;
+}
+
+/**
+ * Runs `supabase db query --local` and returns its stdout.
+ *
+ * Uses spawnSync (not execFileSync) so a non-zero exit does not throw away
+ * stderr: the Postgres error message is the whole point of the diagnostic.
+ * The command is `node <npx-cli.js> ...` with an argument array and no shell,
+ * so nothing can be reinterpreted as a flag or a shell redirect.
+ */
+function runLocalQuery(sql: string): string {
+  const result = spawnSync(
+    process.execPath,
+    [npxCliPath(), '--yes', 'supabase', 'db', 'query', '--local', '--output', 'json', sql],
+    {
+      // No shell: the SQL is passed as a single argv element.
+      shell: false,
+      encoding: 'utf8',
+      timeout: 180_000,
+      // Capture both streams; never inherit (which would print the SQL).
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 10 * 1024 * 1024,
+    },
+  );
+
+  const stdout = result.stdout ?? '';
+  const stderr = result.stderr ?? '';
+
+  if (result.error) {
+    // Spawn-level failure (ENOENT, timeout, EINVAL...). The message is safe:
+    // it describes the process, not the SQL.
+    const reason =
+      (result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT'
+        ? 'the command timed out after 180s'
+        : result.error.message;
+    throw new Error(
+      `[e2e] could not run the local Supabase CLI: ${reason}. ` +
+        'Check that `supabase start` is running and that the CLI is installed.',
+    );
+  }
+
+  if (result.status !== 0) {
+    // Report the exit status and the CLI/Postgres message, redacted. The SQL
+    // statement itself is never printed.
+    const detail = redactDiagnostic(stderr.trim() || stdout.trim() || '<no output>');
+    throw new Error(
+      `[e2e] seeding synthetic auth users failed (exit status ${result.status}).\n` +
+        `--- supabase db query --local output (redacted) ---\n${detail}\n` +
+        '--- end output ---',
+    );
+  }
+
+  return stdout;
+}
+
 async function globalSetup(): Promise<void> {
   // Fails closed: throws if the configuration is missing or points anywhere
   // other than loopback. Setup never silently skips.
@@ -89,8 +176,17 @@ async function globalSetup(): Promise<void> {
   const resilienceEmail = `e2e+resilience-${stamp}@example.com`;
   const onboardingEmail = `e2e+onboarding-${stamp}@example.com`;
 
-  // Insert the users with a bcrypt hash of E2E_PASSWORD. `crypt(..., gen_salt('bf'))`
-  // produces the same format GoTrue uses, so signInWithPassword works normally.
+  // Insert the users with a bcrypt hash of E2E_PASSWORD.
+  // `extensions.crypt(..., extensions.gen_salt('bf'))` produces the same format
+  // GoTrue uses, so signInWithPassword works normally.
+  //
+  // WHY THE `extensions.` PREFIX IS REQUIRED:
+  // Supabase installs pgcrypto into the `extensions` schema, not `public`. The
+  // `db query` session's search_path does not include `extensions` (the pgTAP
+  // suites have to `set local search_path = public, extensions` for the same
+  // reason), so an unqualified `crypt(...)` fails with
+  // "function crypt(unknown, unknown) does not exist". Qualifying the calls
+  // makes the statement independent of the session search_path.
   //
   // GoTrue requires the token columns to be EMPTY STRINGS, not NULL — a NULL
   // there makes the auth server fail with "Database error querying schema".
@@ -114,7 +210,7 @@ async function globalSetup(): Promise<void> {
       'authenticated',
       'authenticated',
       u.email,
-      crypt('${E2E_PASSWORD}', gen_salt('bf')),
+      extensions.crypt('${E2E_PASSWORD}', extensions.gen_salt('bf')),
       now(), now(), now(),
       '{"provider":"email","providers":["email"]}'::jsonb,
       jsonb_build_object('full_name', u.full_name),
@@ -129,17 +225,9 @@ async function globalSetup(): Promise<void> {
     returning id, email;
   `;
 
-  // execFileSync with an argument array: no shell, so the SQL cannot be
-  // reinterpreted as a flag or a shell redirect. `--local` is explicit and
+  // Runs `supabase db query --local` with no shell. `--local` is explicit and
   // there is deliberately no `--linked` / `--remote` / `--db-url`.
-  //
-  // The command is `node <npx-cli.js> ...` rather than `npx ...` so it works
-  // identically on Windows and Linux without a shell (see npxCliPath).
-  const output = execFileSync(
-    process.execPath,
-    [npxCliPath(), '--yes', 'supabase', 'db', 'query', '--local', '--output', 'json', sql],
-    { stdio: 'pipe', timeout: 180_000, encoding: 'utf8' },
-  );
+  const output = runLocalQuery(sql);
 
   // Parse the returned rows to get the generated ids.
   const rows = parseRows(output);
