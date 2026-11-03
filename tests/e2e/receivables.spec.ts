@@ -20,12 +20,19 @@ import {
 
 test.describe('Receivables workflow', () => {
 
-  test('onboarding creates a business and lands on the dashboard', async ({ page }) => {
+  test('onboarding creates a business and lands on the dashboard', async ({ page }, testInfo) => {
     // A dedicated account is created fresh by global-setup on every run and is
     // used by no other test, so it is guaranteed to have zero businesses here.
     // That makes this test repeatable without a conditional skip: the account
     // can never arrive with a business already attached.
-    const { onboarding } = loadAccounts();
+    //
+    // The account is chosen PER PROJECT. This test creates a business, and the
+    // desktop and mobile projects share one accounts file, so a single account
+    // would already have a business when the second project ran — the app would
+    // then correctly show "Add another business" and this test would fail.
+    const accounts = loadAccounts();
+    const onboarding =
+      testInfo.project.name === 'mobile' ? accounts.onboardingMobile : accounts.onboardingDesktop;
 
     await page.goto('/login');
     await page.getByLabel('Email').fill(onboarding.email);
@@ -38,6 +45,8 @@ test.describe('Receivables workflow', () => {
     // than skip.
     await expect(page).toHaveURL(/\/onboarding/, { timeout: 25_000 });
 
+    // The exact first-run heading. "Add another business" means the account
+    // already had a business, which is a setup bug — never accept it here.
     await expect(page.getByRole('heading', { name: 'Set up your business' })).toBeVisible();
 
     await page.getByLabel('Legal business name').fill('E2E Onboard Traders Pvt Ltd');

@@ -140,12 +140,19 @@ export interface E2EAccounts {
   secondary: TestAccount;
   resilience: TestAccount;
   /**
-   * Dedicated to the onboarding test. It is created fresh on every run and is
-   * never used by any other test, so it is guaranteed to have zero businesses
-   * when the onboarding test signs in. This is what makes that test repeatable
+   * Dedicated to the onboarding test, one account PER PROJECT. Both are created
+   * fresh on every run and are used by no other test, so each is guaranteed to
+   * have zero businesses when the onboarding test signs in.
+   *
+   * WHY ONE PER PROJECT: the desktop and mobile projects share this accounts
+   * file, and the onboarding test creates a business. A single shared account
+   * meant the second project to run found a business already attached and the
+   * app correctly rendered "Add another business" instead of "Set up your
+   * business". Separate accounts keep the test repeatable in both projects
    * without a conditional skip.
    */
-  onboarding: TestAccount;
+  onboardingDesktop: TestAccount;
+  onboardingMobile: TestAccount;
 }
 
 function randomId(): string {
@@ -245,7 +252,8 @@ async function globalSetup(): Promise<void> {
   const primaryEmail = `e2e+primary-${stamp}@example.com`;
   const secondaryEmail = `e2e+secondary-${stamp}@example.com`;
   const resilienceEmail = `e2e+resilience-${stamp}@example.com`;
-  const onboardingEmail = `e2e+onboarding-${stamp}@example.com`;
+  const onboardingDesktopEmail = `e2e+onboarding-desktop-${stamp}@example.com`;
+  const onboardingMobileEmail = `e2e+onboarding-mobile-${stamp}@example.com`;
 
   // Discover where pgcrypto actually lives before building the seed statement.
   //
@@ -283,7 +291,8 @@ async function globalSetup(): Promise<void> {
       { email: primaryEmail, fullName: 'E2E Primary' },
       { email: secondaryEmail, fullName: 'E2E Secondary' },
       { email: resilienceEmail, fullName: 'E2E Resilience' },
-      { email: onboardingEmail, fullName: 'E2E Onboarding' },
+      { email: onboardingDesktopEmail, fullName: 'E2E Onboarding Desktop' },
+      { email: onboardingMobileEmail, fullName: 'E2E Onboarding Mobile' },
     ],
     passwordHash,
   );
@@ -299,9 +308,10 @@ async function globalSetup(): Promise<void> {
   const primary = rows.find((row) => row.email === primaryEmail);
   const secondary = rows.find((row) => row.email === secondaryEmail);
   const resilience = rows.find((row) => row.email === resilienceEmail);
-  const onboarding = rows.find((row) => row.email === onboardingEmail);
+  const onboardingDesktop = rows.find((row) => row.email === onboardingDesktopEmail);
+  const onboardingMobile = rows.find((row) => row.email === onboardingMobileEmail);
 
-  if (!primary || !secondary || !resilience || !onboarding) {
+  if (!primary || !secondary || !resilience || !onboardingDesktop || !onboardingMobile) {
     // Do not echo the raw output: it can contain password hashes.
     throw new Error(
       'could not create e2e accounts in the local database. ' +
@@ -324,16 +334,22 @@ async function globalSetup(): Promise<void> {
       password: E2E_PASSWORD,
       userId: requireUuid(resilience.id),
     },
-    onboarding: {
-      email: onboardingEmail,
+    onboardingDesktop: {
+      email: onboardingDesktopEmail,
       password: E2E_PASSWORD,
-      userId: requireUuid(onboarding.id),
+      userId: requireUuid(onboardingDesktop.id),
+    },
+    onboardingMobile: {
+      email: onboardingMobileEmail,
+      password: E2E_PASSWORD,
+      userId: requireUuid(onboardingMobile.id),
     },
   };
 
   writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2), 'utf8');
   console.log(
-    `[e2e] created accounts: ${primaryEmail}, ${secondaryEmail}, ${resilienceEmail}, ${onboardingEmail}`,
+    `[e2e] created accounts: ${primaryEmail}, ${secondaryEmail}, ${resilienceEmail}, ` +
+      `${onboardingDesktopEmail}, ${onboardingMobileEmail}`,
   );
 }
 

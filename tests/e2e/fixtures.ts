@@ -186,8 +186,14 @@ export interface E2EAccounts {
   primary: TestAccount;
   secondary: TestAccount;
   resilience: TestAccount;
-  /** Fresh on every run; used only by the onboarding test. */
-  onboarding: TestAccount;
+  /**
+   * Fresh on every run; used only by the onboarding test. One account per
+   * Playwright project, because that test creates a business and the projects
+   * share this file — a single account would arrive with a business already
+   * attached in whichever project ran second.
+   */
+  onboardingDesktop: TestAccount;
+  onboardingMobile: TestAccount;
 }
 
 /** Loads the accounts created by global-setup. Throws if setup did not run. */

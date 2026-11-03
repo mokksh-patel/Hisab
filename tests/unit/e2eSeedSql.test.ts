@@ -21,7 +21,8 @@ const ACCOUNTS: SeedAccount[] = [
   { email: 'e2e+primary-1-aa@example.com', fullName: 'E2E Primary' },
   { email: 'e2e+secondary-2-bb@example.com', fullName: 'E2E Secondary' },
   { email: 'e2e+resilience-3-cc@example.com', fullName: 'E2E Resilience' },
-  { email: 'e2e+onboarding-4-dd@example.com', fullName: 'E2E Onboarding' },
+  { email: 'e2e+onboarding-desktop-4-dd@example.com', fullName: 'E2E Onboarding Desktop' },
+  { email: 'e2e+onboarding-mobile-5-ee@example.com', fullName: 'E2E Onboarding Mobile' },
 ];
 
 /** Collapses runs of whitespace so assertions do not depend on indentation. */
