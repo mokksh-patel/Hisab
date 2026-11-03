@@ -24,6 +24,8 @@
  * (which has no Node types) can import it.
  */
 
+import { CliOutputError, parseQueryRows } from './cli-output';
+
 /**
  * The catalog query. `pg_extension.extnamespace` is the schema that owns the
  * extension's objects, which is exactly what qualification needs.
@@ -80,38 +82,25 @@ export function assertSafeSchemaName(name: string): string {
 /**
  * Extracts the schema name from `supabase db query --output json` output.
  *
- * The CLI prints a "Connecting to local database..." banner before the JSON
- * payload, so the array is located by its brackets rather than by parsing the
- * whole stream.
+ * The payload is parsed by `parseQueryRows`, which accepts both shapes the CLI
+ * emits: a bare array of rows, and the `{ rows: [...] }` envelope produced by
+ * agent mode (`--agent yes`). See cli-output.ts for the observed samples.
  *
  * Requires EXACTLY ONE row. Zero rows means pgcrypto is not installed; more
  * than one means the catalog returned something unexpected. Both are hard
  * failures — guessing would produce a confusing 42883 later.
  */
 export function parsePgcryptoSchema(output: string): string {
-  const start = output.indexOf('[');
-  const end = output.lastIndexOf(']');
-
-  if (start === -1 || end === -1 || end < start) {
-    throw new PgcryptoSchemaError(
-      'could not parse the pgcrypto schema query output: no JSON array found. ' +
-        'The Supabase CLI may have failed before running the query.',
-    );
-  }
-
-  let rows: unknown;
+  let rows: Record<string, unknown>[];
   try {
-    rows = JSON.parse(output.slice(start, end + 1));
-  } catch {
-    throw new PgcryptoSchemaError(
-      'could not parse the pgcrypto schema query output: invalid JSON.',
-    );
-  }
-
-  if (!Array.isArray(rows)) {
-    throw new PgcryptoSchemaError(
-      'could not parse the pgcrypto schema query output: expected an array of rows.',
-    );
+    rows = parseQueryRows(output);
+  } catch (error) {
+    if (error instanceof CliOutputError) {
+      throw new PgcryptoSchemaError(
+        `could not parse the pgcrypto schema query output: ${error.message}`,
+      );
+    }
+    throw error;
   }
 
   if (rows.length === 0) {
@@ -128,8 +117,8 @@ export function parsePgcryptoSchema(output: string): string {
     );
   }
 
-  const row = rows[0] as Record<string, unknown> | null;
-  const schema = row && typeof row === 'object' ? row.schema_name : undefined;
+  const row = rows[0];
+  const schema = row ? row.schema_name : undefined;
 
   if (typeof schema !== 'string') {
     throw new PgcryptoSchemaError(

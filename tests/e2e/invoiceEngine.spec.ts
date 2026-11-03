@@ -45,8 +45,17 @@ test.describe('Invoice Engine V2', () => {
 
     // Seed a customer so the form can be completed.
     const client = await signInAs(resilience);
-    const businessId = await createBusiness(client, `E2E V2 ${Date.now()}`);
+    const businessName = `E2E V2 ${Date.now()}`;
+    const businessId = await createBusiness(client, businessName);
     await createCustomer(client, businessId, 'E2E V2 Customer', '+919876500111');
+
+    // Point the browser at the business that owns the customer.
+    //
+    // The shared account accumulates businesses across runs, and
+    // BusinessContext keeps whatever id is already in localStorage as long as
+    // it is still valid. Without this the form would query the previously
+    // selected business, find no customers and leave the dropdown empty.
+    await selectBusinessInBrowser(page, businessId, businessName);
 
     await page.goto('/invoices/new');
     await expect(page.getByRole('heading', { name: 'Create invoice' })).toBeVisible({
@@ -68,8 +77,12 @@ test.describe('Invoice Engine V2', () => {
     await signInAndReachApp(page, resilience.email, resilience.password);
 
     const client = await signInAs(resilience);
-    const businessId = await createBusiness(client, `E2E V2I ${Date.now()}`);
+    const businessName = `E2E V2I ${Date.now()}`;
+    const businessId = await createBusiness(client, businessName);
     await createCustomer(client, businessId, 'E2E V2 Inclusive', '+919876500222');
+
+    // See the exclusive test: the selection must be pinned to the new business.
+    await selectBusinessInBrowser(page, businessId, businessName);
 
     await page.goto('/invoices/new');
     await expect(page.getByRole('heading', { name: 'Create invoice' })).toBeVisible({
@@ -173,4 +186,38 @@ async function signInAndReachApp(
     await createButton.click();
     await page.waitForURL('/', { timeout: 30_000 });
   }
+}
+
+/**
+ * Pins the browser's selected business to `businessId`, then reloads so
+ * BusinessContext re-initialises against it.
+ *
+ * WHY A RELOAD IS REQUIRED
+ *   BusinessContext reads `bizpilot.selectedBusinessId` from localStorage only
+ *   in its useState initialiser, and its selection effect keeps the stored id
+ *   whenever it is still valid. Writing localStorage alone therefore has no
+ *   effect on the running app: the in-memory selection is unchanged, and the
+ *   business list is cached with `staleTime: 60_000`. A full reload is what
+ *   makes the context pick up the new id and refetch the list.
+ *
+ * The Topbar assertion is the synchronisation point: it only shows the new
+ * name once the list has been refetched and the selection resolved, so the
+ * subsequent navigation cannot race the context.
+ */
+async function selectBusinessInBrowser(
+  page: import('@playwright/test').Page,
+  businessId: string,
+  businessName: string,
+): Promise<void> {
+  await page.evaluate(
+    ([key, id]) => window.localStorage.setItem(key, id),
+    ['bizpilot.selectedBusinessId', businessId] as const,
+  );
+
+  await page.reload();
+
+  // The Topbar button's accessible name is the display name plus the role.
+  await expect(
+    page.getByRole('button', { name: new RegExp(businessName) }),
+  ).toBeVisible({ timeout: 20_000 });
 }

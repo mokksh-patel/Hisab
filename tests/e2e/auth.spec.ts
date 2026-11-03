@@ -89,7 +89,14 @@ test.describe('Authentication', () => {
     const { primary } = loadAccounts();
 
     await signIn(page, primary.email, primary.password);
-    await expect(page).toHaveURL(/\/onboarding|\//, { timeout: 25_000 });
+
+    // The generated account has no business yet, so the authenticated app
+    // redirects to onboarding. That redirect is asynchronous, so wait for the
+    // final URL instead of asserting on the transient one.
+    await expect(page).toHaveURL(/\/onboarding$/, { timeout: 25_000 });
+    await expect(
+      page.getByRole('button', { name: `Sign out (${primary.email})` }),
+    ).toBeVisible();
 
     // Wait for the session to be persisted before asserting on storage.
     await expect
@@ -102,9 +109,24 @@ test.describe('Authentication', () => {
       )
       .toBeGreaterThan(0);
 
-    const before = page.url();
     await page.reload();
-    await expect(page).toHaveURL(before, { timeout: 25_000 });
+
+    // The restored session must land on the same guarded route again.
+    await expect(page).toHaveURL(/\/onboarding$/, { timeout: 25_000 });
+    await expect(
+      page.getByRole('button', { name: `Sign out (${primary.email})` }),
+    ).toBeVisible();
+
+    // The auth token survived the reload.
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() =>
+            Object.keys(window.localStorage).filter((key) => key.includes('auth-token')).length,
+          ),
+        { timeout: 20_000 },
+      )
+      .toBeGreaterThan(0);
 
     // Still signed in after the reload.
     await expect(page).not.toHaveURL(/\/login/, { timeout: 10_000 });

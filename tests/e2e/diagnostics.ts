@@ -11,6 +11,8 @@
  * Keep the two values in sync — the unit test asserts they match.
  */
 
+import { isBannerOnly } from './cli-output';
+
 /** Must equal E2E_PASSWORD in fixtures.ts. */
 export const E2E_PASSWORD_FOR_REDACTION = 'E2eTestPass123!';
 
@@ -101,6 +103,38 @@ function formatStream(label: 'STDERR' | 'STDOUT', raw: string): string | null {
 }
 
 /**
+ * Counts the UTF-8 bytes in a string.
+ *
+ * Implemented here rather than with `Buffer.byteLength` so this module stays
+ * free of Node built-ins and remains importable from the unit-test project,
+ * which has no Node types. The count is what tells "the CLI printed nothing"
+ * apart from "the CLI printed something we could not parse".
+ */
+export function utf8ByteLength(text: string): number {
+  let bytes = 0;
+  for (const char of text) {
+    const code = char.codePointAt(0) ?? 0;
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code < 0x10000) bytes += 3;
+    else bytes += 4;
+  }
+  return bytes;
+}
+
+/** Everything the diagnostic needs about one failed CLI invocation. */
+export interface CliFailure {
+  /** The Supabase CLI version that actually ran, e.g. "2.122.1". */
+  cliVersion: string;
+  /** Process exit status, or null when the process was killed by a signal. */
+  status: number | null;
+  /** Terminating signal, when the process did not exit on its own. */
+  signal?: string | null;
+  stdout: string;
+  stderr: string;
+}
+
+/**
  * Builds the failure diagnostic from BOTH captured streams.
  *
  * Each stream is reported independently. An earlier version used
@@ -108,21 +142,39 @@ function formatStream(label: 'STDERR' | 'STDOUT', raw: string): string | null {
  * any warning to stderr — and the Supabase CLI writes warnings there on every
  * run, while the actual Postgres error goes to stdout. That made CI failures
  * undiagnosable.
+ *
+ * The header also records the CLI version, the exit status, the signal (if
+ * any) and the raw byte count of each stream. Those four facts are what
+ * distinguish "the wrong CLI ran" from "the CLI ran and the query failed" from
+ * "the CLI printed nothing at all" — the ambiguity that made the original CI
+ * failure impossible to diagnose.
+ *
+ * `bannerOnly` is reported explicitly because a stdout holding nothing but the
+ * "Connecting to local database..." banner means the query never executed,
+ * which is a different problem from a query that executed and failed.
  */
-export function buildFailureDiagnostic(
-  status: number | null,
-  stdout: string,
-  stderr: string,
-): string {
+export function buildFailureDiagnostic(failure: CliFailure): string {
+  const { cliVersion, status, signal, stdout, stderr } = failure;
+
   const sections = [formatStream('STDERR', stderr), formatStream('STDOUT', stdout)].filter(
     (section): section is string => section !== null,
   );
 
   const body = sections.length > 0 ? sections.join('\n\n') : '<no output>';
 
+  const statusText = status === null ? 'unknown' : String(status);
+  const signalText = signal ? signal : 'none';
+
   return (
-    `[e2e] seeding synthetic auth users failed (exit status ${status ?? 'unknown'}).\n` +
-    `--- supabase db query --local output ---\n${body}\n` +
+    `[e2e] seeding synthetic auth users failed (exit status ${statusText}).\n` +
+    `--- supabase db query --local ---\n` +
+    `CLI version: ${cliVersion}\n` +
+    `Exit status: ${statusText}\n` +
+    `Signal: ${signalText}\n` +
+    `stdout bytes: ${utf8ByteLength(stdout)}\n` +
+    `stderr bytes: ${utf8ByteLength(stderr)}\n` +
+    `stdout was only the connection banner: ${isBannerOnly(stdout) ? 'yes' : 'no'}\n` +
+    `--- output ---\n${body}\n` +
     '--- end output ---'
   );
 }
